@@ -1,0 +1,42 @@
+# Build outputs
+build/
+out/
+bin/
+obj/
+target/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.obj
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Never commit game assets or dumps
+*.rpf
+*.ttpf
+*.xvd
+*.ydr
+*.ydd
+*.yft
+*.ybn
+*.ytd
+*.ypt
+*.ysc
+*.awc
+*.bk2
+*.dds
+*.bin
+*.dmp
