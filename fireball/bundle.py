@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .abi import caps_from_names
 from .archive_reader import ZlibPageInfo, parse_int_hex, read_paged_zlib_pages_at
-from .mergers import merge_kv_bytes, merge_xml_bytes
+from .mergers import compact_kv_bytes, compact_xml_slice, merge_kv_bytes, merge_xml_bytes
 from .mod_source import ModManifest, VirtualModSource, load_manifest, open_mod_source
 from .pso_patcher import patch_pso_bytes
 
@@ -406,6 +406,7 @@ class _AssetWorkState:
     pages: List[ZlibPageInfo]
     current_bytes: bytes
     kind_flags: int = 0
+    text_format: str = ""  # "xml" or "kv"
     required_caps: int = 0
     explicit_page_offsets: set[int] = field(default_factory=set)
     contributing_mods: List[str] = field(default_factory=list)
@@ -423,6 +424,54 @@ def _check_mod_dependencies(manifests: List[ModManifest]) -> None:
                 raise ValueError(f"Mod '{m.mod_id}' conflicts with loaded mod '{conf}'")
 
 
+def _apply_size_preserve(st: _AssetWorkState) -> int:
+    """
+    When `--size-preserve` is enabled, ensure every modified page slice and the full
+    text asset satisfy `payload_size <= orig_uncomp_size` by reclaiming non-semantic
+    whitespace/comments only where growth occurred.
+    Returns total bytes reclaimed.
+    """
+    if not (st.kind_flags & FB_DS_FLAG_TEXT_PATCH) or st.text_format not in ("kv", "xml"):
+        return 0
+
+    reclaimed_total = 0
+    num_pages = len(st.pages)
+    if num_pages == 1:
+        max_b = len(st.orig_bytes)
+        if len(st.current_bytes) > max_b:
+            if st.text_format == "kv":
+                st.current_bytes, rec = compact_kv_bytes(st.current_bytes, max_b)
+            else:
+                st.current_bytes, rec = compact_xml_slice(st.current_bytes, max_b)
+            reclaimed_total += rec
+        return reclaimed_total
+
+    # Multi-page text asset: compact any page slice whose byte length exceeds its original page length
+    rebuilt_pages: List[bytes] = []
+    raw_slices: List[bytes] = []
+    for pg in st.pages:
+        if pg.page_index < num_pages - 1:
+            raw_slices.append(st.current_bytes[pg.uncompressed_offset : pg.uncompressed_offset + 65536])
+        else:
+            raw_slices.append(st.current_bytes[pg.uncompressed_offset :])
+
+    for i, pg in enumerate(st.pages):
+        sl = raw_slices[i]
+        if len(sl) > pg.uncompressed_size:
+            if st.text_format == "kv":
+                sl, rec = compact_kv_bytes(sl, pg.uncompressed_size)
+            else:
+                prefix = b"".join(rebuilt_pages)
+                suffix = b"".join(raw_slices[i + 1 :])
+                sl, rec = compact_xml_slice(sl, pg.uncompressed_size, full_prefix=prefix, full_suffix=suffix)
+            reclaimed_total += rec
+        rebuilt_pages.append(sl)
+
+    if reclaimed_total > 0:
+        st.current_bytes = b"".join(rebuilt_pages)
+    return reclaimed_total
+
+
 def build_patch_bundle(
     mod_paths: Sequence[str],
     game_dir: str,
@@ -430,6 +479,7 @@ def build_patch_bundle(
     *,
     bundle_filename: str = "fireball_bundle.fbin",
     extra_overlays: Optional[Dict[str, bytes]] = None,
+    size_preserve: bool = False,
     tools_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -494,6 +544,7 @@ def build_patch_bundle(
                 )
                 st.current_bytes = res.patched_bytes
                 st.kind_flags |= FB_DS_FLAG_TEXT_PATCH
+                st.text_format = "xml"
                 st.required_caps |= caps_from_names(list(p.get("required_caps", [])))
                 if "page_offset" in p:
                     st.explicit_page_offsets.add(parse_int_hex(p["page_offset"]))
@@ -518,6 +569,7 @@ def build_patch_bundle(
                 )
                 st.current_bytes = res.patched_bytes
                 st.kind_flags |= FB_DS_FLAG_TEXT_PATCH
+                st.text_format = "kv"
                 st.required_caps |= caps_from_names(list(p.get("required_caps", [])))
                 if "page_offset" in p:
                     st.explicit_page_offsets.add(parse_int_hex(p["page_offset"]))
@@ -590,8 +642,11 @@ def build_patch_bundle(
         # Build DirectStorage entries: full-asset + changed/explicit per-64KiB-page slices
         ds_entries: List[BundleDStorageEntry] = []
         ds_index_report: List[Dict[str, Any]] = []
+        total_reclaimed_bytes = 0
 
         for (_norm_arch, _off), st in sorted(assets.items()):
+            reclaimed = _apply_size_preserve(st) if size_preserve else 0
+            total_reclaimed_bytes += reclaimed
             orig_total = len(st.orig_bytes)
             patched_total = len(st.current_bytes)
             single_page = len(st.pages) == 1
@@ -617,6 +672,9 @@ def build_patch_bundle(
                     "file_offset": f"0x{full_entry.file_offset:08X}",
                     "orig_uncomp_size": full_entry.orig_uncomp_size,
                     "payload_size": len(full_entry.payload),
+                    "delta": len(full_entry.payload) - full_entry.orig_uncomp_size,
+                    "fits_fixed_dst": len(full_entry.payload) <= full_entry.orig_uncomp_size,
+                    "size_preserve_reclaimed": reclaimed,
                     "payload_crc32": f"0x{full_entry.payload_crc32:08X}",
                     "mods": st.contributing_mods,
                     "patches": st.contributing_patches,
@@ -658,6 +716,8 @@ def build_patch_bundle(
                             "file_offset": f"0x{pg_entry.file_offset:08X}",
                             "orig_uncomp_size": pg_entry.orig_uncomp_size,
                             "payload_size": len(pg_entry.payload),
+                            "delta": len(pg_entry.payload) - pg_entry.orig_uncomp_size,
+                            "fits_fixed_dst": len(pg_entry.payload) <= pg_entry.orig_uncomp_size,
                             "payload_crc32": f"0x{pg_entry.payload_crc32:08X}",
                             "mods": st.contributing_mods,
                             "patches": st.contributing_patches,
@@ -706,6 +766,9 @@ def build_patch_bundle(
             "bundle_file": os.path.abspath(bundle_path),
             "bundle_version": FB_BUNDLE_VERSION,
             "bundle_size_bytes": len(fbin_bytes),
+            "size_preserve": size_preserve,
+            "size_preserve_reclaimed_bytes": total_reclaimed_bytes,
+            "all_fit_fixed_dst": all(len(e.payload) <= e.orig_uncomp_size for e in ds_entries),
             "mods": mod_summaries,
             "dstorage_entry_count": len(ds_entries),
             "overlay_entry_count": len(ov_entries),
@@ -725,3 +788,68 @@ def build_patch_bundle(
     finally:
         for s in sources:
             s.close()
+
+
+def _format_ds_flags(flags: int) -> List[str]:
+    names: List[str] = []
+    if flags & FB_DS_FLAG_FULL_ASSET:
+        names.append("FULL")
+    if flags & FB_DS_FLAG_PAGE_SLICE:
+        names.append("PAGE")
+    if flags & FB_DS_FLAG_TEXT_PATCH:
+        names.append("TEXT")
+    if flags & FB_DS_FLAG_PSO_PATCH:
+        names.append("PSO")
+    return names
+
+
+def inspect_bundle_file(bundle_path: str) -> Dict[str, Any]:
+    """Parse and inspect a `fireball_bundle.fbin` file, returning structured metadata."""
+    with open(bundle_path, "rb") as rf:
+        raw = rf.read()
+    parsed = parse_bundle(raw)
+
+    ds_list: List[Dict[str, Any]] = []
+    for e in parsed.dstorage_entries:
+        delta = len(e.payload) - e.orig_uncomp_size
+        ds_list.append(
+            {
+                "archive_path": e.archive_path,
+                "file_offset": f"0x{e.file_offset:08X}",
+                "orig_uncomp_size": e.orig_uncomp_size,
+                "payload_size": len(e.payload),
+                "delta": delta,
+                "fits_fixed_dst": len(e.payload) <= e.orig_uncomp_size,
+                "flags": _format_ds_flags(e.flags),
+                "payload_crc32": f"0x{e.payload_crc32:08X}",
+            }
+        )
+
+    ov_list = [
+        {
+            "rel_path": e.rel_path,
+            "size_bytes": len(e.payload),
+            "crc32": f"0x{e.payload_crc32:08X}",
+        }
+        for e in parsed.overlay_entries
+    ]
+    cfg_list = [
+        {
+            "mod_id": e.mod_id,
+            "json_len": len(e.config_json.encode("utf-8")),
+            "config_json": e.config_json,
+        }
+        for e in parsed.plugin_configs
+    ]
+    return {
+        "bundle_file": os.path.abspath(bundle_path),
+        "bundle_version": FB_BUNDLE_VERSION,
+        "bundle_size_bytes": len(raw),
+        "dstorage_entry_count": len(ds_list),
+        "overlay_entry_count": len(ov_list),
+        "plugin_config_count": len(cfg_list),
+        "all_fit_fixed_dst": all(d["fits_fixed_dst"] for d in ds_list),
+        "dstorage_entries": ds_list,
+        "overlay_entries": ov_list,
+        "plugin_configs": cfg_list,
+    }

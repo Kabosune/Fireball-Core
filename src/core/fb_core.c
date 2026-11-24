@@ -34,6 +34,20 @@ typedef struct fb_core_state {
     fb_bundle_t         bundle;
     int                 has_bundle;
     fb_plugin_manager_t plugin_mgr;
+
+    /* Per-entry first-hit flags (log once per target without spamming hot loops) */
+    volatile LONG*      ds_first_hit;
+    volatile LONG*      ov_first_hit;
+
+    /* Lock-free atomic live boot telemetry counters */
+    volatile LONG64     dstorage_calls;
+    volatile LONG64     dstorage_hits;
+    volatile LONG64     dstorage_buf_too_small;
+    volatile LONG64     file_open_calls;
+    volatile LONG64     file_open_hits;
+    volatile LONG64     input_events;
+    volatile LONG64     input_consumed;
+    volatile LONG64     frames_seen;
 } fb_core_state_t;
 
 static fb_core_state_t g_core = {
@@ -80,6 +94,7 @@ static void fb_overlay_close(void* user_ctx) {
  * --------------------------------------------------------------------------- */
 
 static int fb_cb_on_file_open(const wchar_t* rel_path, fb_io_override_desc_t* out_desc) {
+    InterlockedIncrement64(&g_core.file_open_calls);
     if (!rel_path || !out_desc) {
         return 0;
     }
@@ -122,11 +137,32 @@ static int fb_cb_on_file_open(const wchar_t* rel_path, fb_io_override_desc_t* ou
     out_desc->read_at = fb_overlay_read_at;
     out_desc->close = fb_overlay_close;
 
+    InterlockedIncrement64(&g_core.file_open_hits);
+    ptrdiff_t idx = entry - g_core.bundle.ov_entries;
+    int log_first = 0;
+    uint64_t virtual_size = entry->payload_size;
+    if (g_core.ov_first_hit && idx >= 0 && (uint32_t)idx < g_core.bundle.ov_count) {
+        if (InterlockedCompareExchange(&g_core.ov_first_hit[idx], 1, 0) == 0) {
+            log_first = 1;
+        }
+    }
+
     ReleaseSRWLockShared(&g_core.lock);
+    if (log_first) {
+        char msg[512];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "First file_open overlay hit: '%s' (%llu B)",
+            norm_path,
+            (unsigned long long)virtual_size);
+        core_log(FB_LOG_INFO, "fireball-core", msg);
+    }
     return 1;
 }
 
 static int fb_cb_on_dstorage_read(const fb_dstorage_req_view_t* req) {
+    InterlockedIncrement64(&g_core.dstorage_calls);
     if (!req || !req->file_path) {
         return 0;
     }
@@ -162,6 +198,7 @@ static int fb_cb_on_dstorage_read(const fb_dstorage_req_view_t* req) {
 
     /* Enforce destination buffer bounds strictly before touching dst_ptr */
     if (!req->dst_ptr || req->dst_size < entry->payload_size) {
+        InterlockedIncrement64(&g_core.dstorage_buf_too_small);
         char msg[512];
         snprintf(
             msg,
@@ -186,7 +223,31 @@ static int fb_cb_on_dstorage_read(const fb_dstorage_req_view_t* req) {
             (size_t)(req->uncomp_size - entry->payload_size));
     }
 
+    InterlockedIncrement64(&g_core.dstorage_hits);
+    ptrdiff_t idx = entry - g_core.bundle.ds_entries;
+    int log_first = 0;
+    uint32_t orig_sz = entry->orig_uncomp_size;
+    uint32_t pay_sz = entry->payload_size;
+    if (g_core.ds_first_hit && idx >= 0 && (uint32_t)idx < g_core.bundle.ds_count) {
+        if (InterlockedCompareExchange(&g_core.ds_first_hit[idx], 1, 0) == 0) {
+            log_first = 1;
+        }
+    }
+
     ReleaseSRWLockShared(&g_core.lock);
+    if (log_first) {
+        char msg[512];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "First DirectStorage hit: '%s' @ 0x%llX (orig=%u B, patched=%u B, dst=%u B)",
+            norm_path,
+            (unsigned long long)req->file_offset,
+            orig_sz,
+            pay_sz,
+            req->dst_size);
+        core_log(FB_LOG_INFO, "fireball-core", msg);
+    }
     return 1;
 }
 
@@ -212,6 +273,7 @@ static int fb_cb_on_bvh_rehydrate(uint64_t archetype_h64, uint64_t drawable_h64)
 }
 
 static void fb_cb_on_frame_begin(uint64_t frame_index, double dt_sec) {
+    InterlockedIncrement64(&g_core.frames_seen);
     fb_frame_event_v1_t ev;
     ev.frame_index = frame_index;
     ev.dt_sec = dt_sec;
@@ -232,6 +294,7 @@ static void fb_cb_on_frame_present(void* d3d12_swapchain_or_null) {
 }
 
 static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
+    InterlockedIncrement64(&g_core.input_events);
     if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t)) {
         return 0;
     }
@@ -241,7 +304,28 @@ static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
         consumed = fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_INPUT_EVENT, ev);
     }
     ReleaseSRWLockShared(&g_core.lock);
+    if (consumed) {
+        InterlockedIncrement64(&g_core.input_consumed);
+    }
     return consumed;
+}
+
+static void fb_free_first_hit_arrays(void) {
+    free((void*)g_core.ds_first_hit);
+    free((void*)g_core.ov_first_hit);
+    g_core.ds_first_hit = NULL;
+    g_core.ov_first_hit = NULL;
+}
+
+static void fb_reset_telemetry(void) {
+    g_core.dstorage_calls = 0;
+    g_core.dstorage_hits = 0;
+    g_core.dstorage_buf_too_small = 0;
+    g_core.file_open_calls = 0;
+    g_core.file_open_hits = 0;
+    g_core.input_events = 0;
+    g_core.input_consumed = 0;
+    g_core.frames_seen = 0;
 }
 
 static void fb_cb_on_shutdown(void) {
@@ -250,12 +334,31 @@ static void fb_cb_on_shutdown(void) {
         ReleaseSRWLockExclusive(&g_core.lock);
         return;
     }
+    {
+        char msg[512];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "Telemetry summary: dstorage_calls=%lld dstorage_hits=%lld dstorage_buf_too_small=%lld | "
+            "file_open_calls=%lld file_open_hits=%lld | frames_seen=%lld | input_events=%lld input_consumed=%lld",
+            (long long)g_core.dstorage_calls,
+            (long long)g_core.dstorage_hits,
+            (long long)g_core.dstorage_buf_too_small,
+            (long long)g_core.file_open_calls,
+            (long long)g_core.file_open_hits,
+            (long long)g_core.frames_seen,
+            (long long)g_core.input_events,
+            (long long)g_core.input_consumed);
+        core_log(FB_LOG_INFO, "fireball-core", msg);
+    }
     core_log(FB_LOG_INFO, "fireball-core", "Shutting down Fireball-Core runtime...");
     fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
+    fb_free_first_hit_arrays();
     if (g_core.has_bundle) {
         fb_bundle_free(&g_core.bundle);
         g_core.has_bundle = 0;
     }
+    fb_reset_telemetry();
     memset(&g_core.host_api, 0, sizeof(g_core.host_api));
     g_core.game_root_utf8[0] = '\0';
     g_core.game_root_utf8_len = 0;
@@ -378,12 +481,15 @@ FB_API int fb_attach_host(
     if (g_core.attached) {
         /* Cleanly tear down any previous attachment before re-attaching */
         fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
+        fb_free_first_hit_arrays();
         if (g_core.has_bundle) {
             fb_bundle_free(&g_core.bundle);
             g_core.has_bundle = 0;
         }
         g_core.attached = 0;
     }
+
+    fb_reset_telemetry();
 
     g_core.host_api = *host_api;
     snprintf(g_core.host_name_copy, sizeof(g_core.host_name_copy), "%s", host_api->host_name ? host_api->host_name : "unknown");
@@ -432,6 +538,12 @@ FB_API int fb_attach_host(
             int brc = fb_bundle_load_file(bundle_path, &g_core.bundle, err_buf, sizeof(err_buf));
             if (brc == FB_OK) {
                 g_core.has_bundle = 1;
+                if (g_core.bundle.ds_count > 0) {
+                    g_core.ds_first_hit = (volatile LONG*)calloc(g_core.bundle.ds_count, sizeof(LONG));
+                }
+                if (g_core.bundle.ov_count > 0) {
+                    g_core.ov_first_hit = (volatile LONG*)calloc(g_core.bundle.ov_count, sizeof(LONG));
+                }
                 char msg[512];
                 snprintf(
                     msg,

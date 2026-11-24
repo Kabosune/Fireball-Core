@@ -21,6 +21,12 @@ _Static_assert(sizeof(fb_io_override_desc_t) > 0, "fb_io_override_desc_t must be
 _Static_assert(sizeof(fb_input_event_v1_t) == 32, "fb_input_event_v1_t must be 32 bytes");
 _Static_assert(sizeof(fb_plugin_info_v1_t) > 0, "fb_plugin_info_v1_t must be complete");
 _Static_assert(sizeof(fb_core_services_v1_t) > 0, "fb_core_services_v1_t must be complete");
+#if defined(_M_X64) || defined(__x86_64__)
+_Static_assert(sizeof(fb_io_override_desc_t) == 32, "x64 fb_io_override_desc_t must be 32 bytes");
+_Static_assert(sizeof(fb_dstorage_req_view_t) == 48, "x64 fb_dstorage_req_view_t must be 48 bytes");
+_Static_assert(sizeof(fb_host_api_v1_t) == 104, "x64 fb_host_api_v1_t must be 104 bytes");
+_Static_assert(sizeof(fb_modcore_callbacks_v1_t) == 88, "x64 fb_modcore_callbacks_v1_t must be 88 bytes");
+#endif
 
 int fb_abi_check_c11_anchor(void) {
     fb_host_api_v1_t api = { 0 };

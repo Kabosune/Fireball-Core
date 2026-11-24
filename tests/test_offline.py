@@ -29,11 +29,18 @@ from fireball.bundle import (  # noqa: E402
     CompiledBundle,
     build_patch_bundle,
     dstorage_key_hash,
+    inspect_bundle_file,
     normalize_rel_path,
     parse_bundle,
     serialize_bundle,
 )
-from fireball.mergers import merge_kv_bytes, merge_xml_bytes  # noqa: E402
+from fireball.mergers import (  # noqa: E402
+    compact_kv_bytes,
+    compact_xml_slice,
+    merge_kv_bytes,
+    merge_xml_bytes,
+    parse_kv_pairs,
+)
 from fireball.mock_host import run_mock_host_suite  # noqa: E402
 from fireball.mod_source import load_manifest, open_mod_source, pack_mod_to_zip  # noqa: E402
 
@@ -261,6 +268,88 @@ class TestFireballOffline(unittest.TestCase):
             with open(rep["provenance_file"], "r", encoding="utf-8") as rf:
                 prov = json.load(rf)
             self.assertEqual(prov["total_field_changes"], 2)
+
+    def test_size_preserve_kv_xml_and_inspect_bundle(self) -> None:
+        # 1. KV compaction reclaims repeated tabs while preserving 100% (key, value) parity
+        kv_orig = (
+            b"// comment header\r\n"
+            b"defaultmotionblur.fpv.strength\t\t0.2\r\n"
+            b"motionblur.fpv.MBLowCameraRotSpeedScale\t\t0.75\r\n"
+            b"motionblur.fpv.MBHighCameraRotSpeedScale\t\t0.3\r\n"
+        )
+        kv_res = merge_kv_bytes(
+            kv_orig,
+            [
+                {"op": "set", "key": "defaultmotionblur.fpv.strength", "value": "0.05"},
+                {"op": "scale", "key": "motionblur.fpv.MBLowCameraRotSpeedScale", "factor": 0.5},
+                {"op": "scale", "key": "motionblur.fpv.MBHighCameraRotSpeedScale", "factor": 0.5},
+            ],
+            mod_id="test.sp",
+            patch_id="kv_sp",
+            target="commoncrc:/data/visualsettings",
+        )
+        self.assertGreater(len(kv_res.patched_bytes), len(kv_orig))
+        compacted_kv, reclaimed = compact_kv_bytes(kv_res.patched_bytes, len(kv_orig))
+        self.assertLessEqual(len(compacted_kv), len(kv_orig))
+        self.assertEqual(reclaimed, len(kv_res.patched_bytes) - len(compacted_kv))
+        self.assertEqual(parse_kv_pairs(compacted_kv), parse_kv_pairs(kv_res.patched_bytes))
+
+        # 2. XML compaction reclaims indentation & comments while preserving exact DOM
+        xml_orig = b"<Root>\n  <!-- optional comment -->\n        <Flag value=\"no\" />\n        <Other value=\"1\" />\n</Root>\n"
+        xml_grown = b"<Root>\n  <!-- optional comment -->\n        <Flag value=\"yes_longer_value\" />\n        <Other value=\"1\" />\n</Root>\n"
+        compacted_xml, xml_rec = compact_xml_slice(xml_grown, len(xml_orig))
+        self.assertLessEqual(len(compacted_xml), len(xml_orig))
+        self.assertGreater(xml_rec, 0)
+        self.assertIn(b'value="yes_longer_value"', compacted_xml)
+        # Impossible compaction target raises cleanly instead of silently overflowing
+        with self.assertRaises(ValueError):
+            compact_xml_slice(xml_grown, 10)
+
+        # 3. End-to-end build-bundle --size-preserve + inspect-bundle CLI on synthetic KV archive
+        with tempfile.TemporaryDirectory() as td:
+            game_dir = os.path.join(td, "game")
+            out_dir = os.path.join(td, "out")
+            mod_dir = os.path.join(td, "mod")
+            os.makedirs(game_dir, exist_ok=True)
+            os.makedirs(os.path.join(mod_dir, "patches"), exist_ok=True)
+
+            comp = zlib.compress(kv_orig, level=9)
+            self.assertEqual(comp[:2], b"\x78\xda")
+            with open(os.path.join(game_dir, "common.rpf"), "wb") as wf:
+                wf.write(b"\x00" * 0x100 + comp)
+
+            with open(os.path.join(mod_dir, "mod.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[mod]\nid = "test.sp"\nname = "SP"\nversion = "1.0.0"\n'
+                    'target_game_version = "1.0.2.1"\nmin_fireball_abi = 1\n'
+                    '[[patches.kv]]\nid = "kv_sp"\ntarget = "commoncrc:/data/visualsettings"\n'
+                    'archive = "common.rpf"\narchive_offset = "0x100"\npatch = "patches/kv.toml"\n'
+                )
+            with open(os.path.join(mod_dir, "patches", "kv.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[[ops]]\nop = "set"\nkey = "defaultmotionblur.fpv.strength"\nvalue = "0.05"\n'
+                    '[[ops]]\nop = "scale"\nkey = "motionblur.fpv.MBLowCameraRotSpeedScale"\nfactor = 0.5\n'
+                    '[[ops]]\nop = "scale"\nkey = "motionblur.fpv.MBHighCameraRotSpeedScale"\nfactor = 0.5\n'
+                )
+
+            rep = build_patch_bundle([mod_dir], game_dir, out_dir, size_preserve=True)
+            self.assertTrue(rep["all_fit_fixed_dst"])
+            self.assertGreater(rep["size_preserve_reclaimed_bytes"], 0)
+
+            insp = inspect_bundle_file(rep["bundle_file"])
+            self.assertTrue(insp["all_fit_fixed_dst"])
+            self.assertEqual(insp["dstorage_entry_count"], 1)
+            self.assertLessEqual(insp["dstorage_entries"][0]["delta"], 0)
+
+            proc = subprocess.run(
+                [sys.executable, "-B", os.path.join(ROOT, "fireball_cli.py"), "inspect-bundle", rep["bundle_file"]],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("all_fit_fixed_dst=True", proc.stdout)
+            self.assertIn("common.rpf", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,12 @@
+[package]
+name = "victory-fireball"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Zero-dependency optional dynamic-loading bridge between Marvisak/VIctory and Fireball-Core (fireball_core.dll, C11 ABI v1)."
+
+[lib]
+name = "victory_fireball"
+path = "src/lib.rs"
+
+[dependencies]

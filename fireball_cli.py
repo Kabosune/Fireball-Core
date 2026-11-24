@@ -22,7 +22,7 @@ if _ROOT_DIR not in sys.path:
 
 from fireball.abi import verify_c11_headers  # noqa: E402
 from fireball.archive_reader import parse_int_hex, read_paged_zlib_at, read_single_zlib_chunk_at  # noqa: E402
-from fireball.bundle import build_patch_bundle  # noqa: E402
+from fireball.bundle import build_patch_bundle, inspect_bundle_file  # noqa: E402
 from fireball.mergers import merge_kv_bytes, merge_xml_bytes  # noqa: E402
 from fireball.mock_host import run_mock_host_suite  # noqa: E402
 from fireball.mod_source import load_manifest, open_mod_source, pack_mod_to_zip  # noqa: E402
@@ -311,9 +311,41 @@ def cmd_build_bundle(args: argparse.Namespace) -> int:
         args.out,
         bundle_filename=args.bundle_name,
         extra_overlays=extra_overlays or None,
+        size_preserve=bool(args.size_preserve),
         tools_dir=args.tools_dir,
     )
     print(json.dumps(rep, indent=2))
+    return 0
+
+
+def cmd_inspect_bundle(args: argparse.Namespace) -> int:
+    info = inspect_bundle_file(args.bundle)
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+
+    print(
+        f"Bundle: {info['bundle_file']} (v{info['bundle_version']}, {info['bundle_size_bytes']:,} B, "
+        f"all_fit_fixed_dst={info['all_fit_fixed_dst']})"
+    )
+    print(f"DirectStorage entries ({info['dstorage_entry_count']}):")
+    print(
+        f"  {'Archive':<18} {'Offset':<12} {'OrigSize':>10} {'Patched':>10} {'Delta':>7} "
+        f"{'FitsDst':>7} {'CRC32':<12} Flags"
+    )
+    for e in info["dstorage_entries"]:
+        flags_s = "|".join(e["flags"])
+        print(
+            f"  {e['archive_path']:<18} {e['file_offset']:<12} {e['orig_uncomp_size']:>10} "
+            f"{e['payload_size']:>10} {e['delta']:>+7} {str(e['fits_fixed_dst']):>7} "
+            f"{e['payload_crc32']:<12} {flags_s}"
+        )
+    print(f"Loose-file overlays ({info['overlay_entry_count']}):")
+    for o in info["overlay_entries"]:
+        print(f"  {o['rel_path']} ({o['size_bytes']:,} B, crc32={o['crc32']})")
+    print(f"Plugin configs ({info['plugin_config_count']}):")
+    for c in info["plugin_configs"]:
+        print(f"  {c['mod_id']} ({c['json_len']} B JSON)")
     return 0
 
 
@@ -531,6 +563,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="fireball_bundle.fbin",
         help="Output bundle filename under --out (default: fireball_bundle.fbin)",
     )
+    p_bun.add_argument(
+        "--size-preserve",
+        action="store_true",
+        help="Reclaim non-semantic whitespace/comments in grown XML/KV pages so payload_size <= orig_uncomp_size",
+    )
+
+    p_ins = sub.add_parser("inspect-bundle", help="Inspect a compiled fireball_bundle.fbin file.")
+    p_ins.add_argument("bundle", help="Path to fireball_bundle.fbin")
+    p_ins.add_argument("--json", action="store_true", help="Emit structured JSON instead of a table")
 
     p_all = sub.add_parser("verify-all", help="Run the full end-to-end vertical-slice verification suite.")
     p_all.add_argument("--mod", default=DEFAULT_MOD_DIR, help="Loose mod folder (default: examples/fpv_unlocker)")
@@ -547,6 +588,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "chks-probe": cmd_chks_probe,
         "simulate": cmd_simulate,
         "build-bundle": cmd_build_bundle,
+        "inspect-bundle": cmd_inspect_bundle,
         "verify-all": cmd_verify_all,
     }
     return dispatch[args.cmd](args)

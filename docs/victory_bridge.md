@@ -64,99 +64,61 @@ Map each file-source request into `fb_dstorage_req_view_t`:
 ### Important Buffer Sizing Note for Text Patches
 - **Binary PSO patches** (e.g. `data.rpf @ 0x006C6000`, `0x0063F000`, `0x006A2000`) preserve exact byte length (`delta == 0`), so `payload_size == orig_uncomp_size` always fits `dst_size = uncomp_size`.
 - **Shrunk text patches** (e.g. `lasso_data.meta` @ `common.rpf:0x0003BA30`: `61,103 -> 61,096` B, `-7` B) always fit `dst_size = uncomp_size`; Fireball zero-pads the remaining `uncomp_size - payload_size` bytes cleanly.
-- **Grown text patches** (e.g. `visualsettings.dat` @ `common.rpf:0x00643650`: `51,640 -> 51,643` B, `+3` B): if `dstorage.rs` passes `dst_size = 51640` (exact `uncomp_size`), Fireball's bounds check will refuse to overflow and pass through with a `WARN` log. Either:
-  1. Pass the actual staging allocation size (e.g. 64 KiB page-rounded buffer) in `dst_size` when available and update the completed length, **or**
-  2. For initial fixed-buffer smoke tests on `visualsettings.dat`, test a same-length / shorter value (e.g. `0.2 -> 0.0` or `0.75 -> 0.37`) first so `payload_size <= orig_uncomp_size`!
+- **Grown text patches** (e.g. `visualsettings.dat` @ `common.rpf:0x00643650`: `51,640 -> 51,643` B, `+3` B): pass `--size-preserve` to `fireball_cli.py build-bundle`! `--size-preserve` reclaims non-semantic whitespace/comments (for `visualsettings.dat`, collapsing 3 repeated `\t\t` separators into `\t` with zero deleted comments and 100% verified KV semantic parity) so `payload_size <= orig_uncomp_size` (`51,640 <= 51,640`) fits exact-size DirectStorage buffers natively. Verify fit anytime via `fireball_cli.py inspect-bundle <path.fbin>`.
 
 ---
 
-## 4. Minimal Rust FFI Skeleton (`victory-hle/src/fireball_bridge.rs`)
+## 4. Drop-In Rust Crate (`bridges/victory-fireball/`) & Exact `VIctory` Call Sites
 
+Fireball-Core ships a ready-to-use, zero-dependency Rust crate in [`bridges/victory-fireball/`](../bridges/victory-fireball/) (`victory_fireball`) that implements the full `#[repr(C)]` ABI v1 bindings, `LoadLibraryW` optional loading (`VICTORY_FIREBALL_DLL` -> exe dir -> `mods_root_dir`), RAII `VirtualOverlayFile`, and thread-safe global one-liner helpers.
+
+### 1) `Cargo.toml` (optional path dependency in `victory-hle/Cargo.toml`)
+```toml
+[dependencies]
+victory-fireball = { path = "../../fireball-core/bridges/victory-fireball" }
+```
+*(Zero external crates are pulled in — `victory-fireball` uses pure `std` + raw `kernel32` Win32 externs.)*
+
+### 2) Startup & Teardown (`victory-hle` runtime init / exit)
 ```rust
-use core::ffi::{c_char, c_int, c_void};
-
-pub const FB_HOST_ABI_VERSION: u32 = 1;
-pub const FB_OK: c_int = 0;
-
-pub const FB_CAP_IO_VIRTUAL: u64         = 1 << 0;
-pub const FB_CAP_DSTORAGE_INTERCEPT: u64 = 1 << 1;
-pub const FB_CAP_FRAME_LIFECYCLE: u64    = 1 << 7;
-pub const FB_CAP_INPUT_EVENTS: u64       = 1 << 8;
-pub const FB_CAP_RAGE_SYMBOL_REG: u64    = 1 << 25;
-pub const FB_CAP_TITLE_MEM_RW: u64       = 1 << 26;
-
-#[repr(C)]
-pub struct FbIoOverrideDesc {
-    pub virtual_size: u64,
-    pub user_ctx: *mut c_void,
-    pub read_at: Option<unsafe extern "C" fn(*mut c_void, u64, *mut c_void, u64) -> i64>,
-    pub close: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-#[repr(C)]
-pub struct FbDStorageReqView {
-    pub file_path: *const u16,
-    pub file_offset: u64,
-    pub src_size: u32,
-    pub uncomp_size: u32,
-    pub codec_hint: u32,
-    pub dst_ptr: *mut c_void,
-    pub dst_size: u32,
-}
-
-#[repr(C)]
-pub struct FbInputEventV1 {
-    pub struct_size: u32,
-    pub device_kind: u32,
-    pub code: u32,
-    pub action: u32,
-    pub modifiers: u32,
-    pub reserved: u32,
-    pub timestamp_us: u64,
-}
-
-#[repr(C)]
-pub struct FbHostApiV1 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub host_name: *const c_char,
-    pub host_version: *const c_char,
-    pub game_root_dir: *const u16,
-    pub mods_root_dir: *const u16,
-    pub capabilities: u64,
-    pub log: Option<unsafe extern "C" fn(c_int, *const c_char, *const c_char)>,
-    pub resolve_symbol: Option<unsafe extern "C" fn(*const c_char) -> *mut c_void>,
-    pub request_dxr_blas_build: Option<unsafe extern "C" fn(u64, *const c_void) -> c_int>,
-    pub register_linear_tex_bypass: Option<unsafe extern "C" fn(u64, c_int) -> c_int>,
-    pub poll_key_state: Option<unsafe extern "C" fn(u32, u32) -> c_int>,
-    pub title_mem_read_u32: Option<unsafe extern "C" fn(u64, *mut u32) -> c_int>,
-    pub title_mem_write_u32: Option<unsafe extern "C" fn(u64, u32) -> c_int>,
-}
-
-#[repr(C)]
-pub struct FbModcoreCallbacksV1 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub on_file_open: Option<unsafe extern "C" fn(*const u16, *mut FbIoOverrideDesc) -> c_int>,
-    pub on_dstorage_read: Option<unsafe extern "C" fn(*const FbDStorageReqView) -> c_int>,
-    pub on_shader_load: Option<unsafe extern "C" fn(*const u8, *const u8, *const c_char, *mut *const c_void, *mut usize) -> c_int>,
-    pub on_bvh_rehydrate: Option<unsafe extern "C" fn(u64, u64) -> c_int>,
-    pub on_frame_begin: Option<unsafe extern "C" fn(u64, f64)>,
-    pub on_frame_present: Option<unsafe extern "C" fn(*mut c_void)>,
-    pub on_input_event: Option<unsafe extern "C" fn(*const FbInputEventV1) -> c_int>,
-    pub on_shutdown: Option<unsafe extern "C" fn()>,
-    pub on_rage_vfs_open: Option<unsafe extern "C" fn(*const c_char, *mut FbIoOverrideDesc) -> c_int>,
-    pub on_rage_datafile_register: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> c_int>,
-}
-
-pub type FbAttachHostFn = unsafe extern "C" fn(*const FbHostApiV1, *mut FbModcoreCallbacksV1) -> c_int;
+let cfg = victory_fireball::HostConfig::tier0_default(game_root_dir.clone(), mods_root_dir.clone());
+let _ = victory_fireball::init_global(cfg, Arc::new(VictoryFireballHooks::new()));
+// On clean runtime exit (flushes live boot telemetry summary + unloads plugins):
+victory_fireball::shutdown_global();
 ```
 
-Call sites inside `VIctory` reduce to:
-- `dstorage.rs`: `if fireball_bridge::try_dstorage_read(&req_view) { return Ok(()); }`
-- `files.rs`: `if let Some(vhandle) = fireball_bridge::try_file_open(rel_path) { return Ok(vhandle); }`
-- `gameinput.rs`: `if fireball_bridge::dispatch_input_event(&ev) { return; }`
-- `victory-gpu`: `fireball_bridge::on_frame_begin(frame_idx, dt);` and `fireball_bridge::on_frame_present(swapchain);`
+### 3) The 4 One-Line Hook Call Sites in `Marvisak/VIctory`
+- **`victory-hle::modules::files` (`files.rs`)** — loose-file overlay virtualization:
+  ```rust
+  if let Some(vfile) = victory_fireball::try_file_open(&rel_path) {
+      return Ok(register_virtual_handle(vfile));
+  }
+  ```
+- **`victory-hle::modules::dstorage` (`dstorage.rs`)** — pre-decompression DirectStorage interception:
+  ```rust
+  let mut fb_req = victory_fireball::DStorageReq {
+      file_path: &archive_rel_path,
+      file_offset: req.file_offset,
+      src_size: req.src_size,
+      uncomp_size: req.uncomp_size,
+      codec_hint: req.codec_hint,
+      dst: dst_slice,
+  };
+  if victory_fireball::try_dstorage_read(&mut fb_req) {
+      return Ok(());
+  }
+  ```
+- **`victory-hle::modules::gameinput` (`gameinput.rs`)** — hotkey interception:
+  ```rust
+  if victory_fireball::dispatch_input_event(&fb_input_ev) {
+      return; // consumed by active Fireball plugin
+  }
+  ```
+- **`victory-gpu` (frame/present boundary)**:
+  ```rust
+  victory_fireball::on_frame_begin(frame_idx, dt_sec);
+  victory_fireball::on_frame_present(swapchain_ptr);
+  ```
 
 ---
 
@@ -166,27 +128,28 @@ Execute these phases in order so each layer is isolated before testing the next:
 
 ### Phase A — Build & Stage Artifacts (Read-Only Against `D:\Games\GTA6`)
 - [ ] Build `fireball_core.dll` and `fpv_toggle.fbplugin.dll` in Release (`cmake --build build --config Release`).
-- [ ] Compile the bundle into a scratch mods directory outside `D:\Games\GTA6`:
+- [ ] Compile a fixed-buffer-safe bundle into a scratch mods directory outside `D:\Games\GTA6` and verify all entries report `FitsDst=True`:
   ```powershell
-  python -B fireball_cli.py --game-dir D:\Games\GTA6 --out D:\GTA6-work\fireball-test\mods build-bundle
+  python -B fireball_cli.py --game-dir D:\Games\GTA6 --out D:\GTA6-work\fireball-test\mods build-bundle --size-preserve
+  python -B fireball_cli.py inspect-bundle D:\GTA6-work\fireball-test\mods\fireball_bundle.fbin
   ```
 - [ ] Copy `build/Release/fireball_core.dll` next to `victory.exe` (or point `VICTORY_FIREBALL_DLL` to it) and copy `build/Release/fpv_toggle.fbplugin.dll` into `D:\GTA6-work\fireball-test\mods\`.
 - [ ] Boot `VIctory` with Tier 0 capabilities only (`FB_CAP_IO_VIRTUAL | FB_CAP_DSTORAGE_INTERCEPT | FB_CAP_FRAME_LIFECYCLE`) and verify logs show:
   - `Attached to host 'VIctory-HLE' ...`
   - `Loaded fireball_bundle.fbin (...): 8 DirectStorage entries, ...`
   - `Skipped plugin 'fpv_toggle' ... lacks required capabilities [FB_CAP_INPUT_EVENTS | FB_CAP_RAGE_SYMBOL_REG | FB_CAP_TITLE_MEM_RW]` (clean Tier 0 degradation, zero crashes).
+  - On shutdown: `Telemetry summary: dstorage_calls=... dstorage_hits=... dstorage_buf_too_small=0 | ...` plus `First DirectStorage hit: ...` lines showing which archive offsets actually triggered!
 
 ### Phase B — Text Override Smoke Test (`visualsettings.dat` + `lasso_data.meta`)
-- [ ] Enable `on_dstorage_read` logging in `dstorage.rs` for `common.rpf`.
-- [ ] Confirm whether `game_scarlett_master.exe` requests `common.rpf` by full asset offset (`0x0003B000` / `0x00640000`) or per-64KiB-page offset (`0x0003BA30` / `0x00643650`), and record the exact `uncomp_size` and `dst_size` values observed in `VIctory`.
-- [ ] Verify `lasso_data.meta` (`common.rpf @ 0x0003BA30`, shrunk `-7` B) returns `1` from `on_dstorage_read` and parses without error in RAGE's XML loader.
-- [ ] Verify `visualsettings.dat` (`common.rpf @ 0x00643650`, mounted as `commoncrc:/data/visualsettings`):
-  - Confirm `dst_size` capacity (note `+3` B growth: `51,640 -> 51,643` B; if `dst_size == 51640`, test a same-length KV edit first to isolate `commoncrc:/` enforcement from buffer capacity).
+- [ ] Watch `First DirectStorage hit:` logs emitted by `fireball_core.dll` for `common.rpf`.
+- [ ] Confirm whether `game_scarlett_master.exe` requests `common.rpf` by full asset offset (`0x0003B000` / `0x00640000`) or per-64KiB-page offset (`0x0003BA30` / `0x00643650`), and record the exact `orig`, `patched`, and `dst` sizes logged.
+- [ ] Verify `lasso_data.meta` (`common.rpf @ 0x0003BA30`, `61,103 -> 61,096` B) returns `1` from `on_dstorage_read` and parses without error in RAGE's XML loader.
+- [ ] Verify `visualsettings.dat` (`common.rpf @ 0x00643650`, compiled with `--size-preserve` to exact `51,640` B, mounted as `commoncrc:/data/visualsettings`):
+  - Confirm `on_dstorage_read` hits with `dstorage_buf_too_small=0`.
   - Record empirically whether `commoncrc:/` rejects modified `visualsettings.dat` or accepts it without a CRC bypass.
 
 ### Phase C — Binary Camera PSO Smoke Test (`CHKS +0x0C` Verification)
-- [ ] Observe `data.rpf` DirectStorage requests for `0x006C6000` (`54,804` B, `view_mode` enum `0 -> 2`), `0x0063F000` (`16,856` B, `camFreeCameraMetadata`), and `0x006A2000` (`69,132` B / `page[0]` `65,536` B, `CAIConditionEquippedWeaponHasScope`).
-- [ ] Confirm `on_dstorage_read` returns `1` for `data.rpf @ 0x006C6000` (exact byte length, `delta == 0`).
+- [ ] Observe `First DirectStorage hit:` logs for `data.rpf` (`0x006C6000` `54,804` B `view_mode` enum `0 -> 2`, `0x0063F000` `16,856` B `camFreeCameraMetadata`, and `0x006A2000` `69,132` B / `page[0]` `65,536` B `CAIConditionEquippedWeaponHasScope`).
 - [ ] **Key empirical question**: observe whether the title's PSO deserializer accepts the patched `0x006C6000` PSO with the original `CHKS +0x0C` word intact, or rejects/asserts on checksum mismatch:
   - **If accepted**: Tier 0 DirectStorage interception alone is sufficient for binary PSO mods — no `CHKS` bypass needed!
   - **If rejected**: confirms Tier 1 `FB_CAP_RAGE_CRC_BYPASS` (or solving `CHKS +0x0C`) is required for modified PSOs.

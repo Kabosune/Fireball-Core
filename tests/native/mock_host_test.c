@@ -602,10 +602,69 @@ static void verify_real_bundle_against_expect_dir(const fb_modcore_callbacks_v1_
     verify_ds_passthrough(cb, L"common.rpf", 0x00001000ull, 4096u, 4096u);
 }
 
+static void verify_size_preserve_visualsettings(const fb_modcore_callbacks_v1_t* cb) {
+    printf("[2b] Verifying --size-preserve visualsettings.dat fits exact 51,640 B fixed DirectStorage buffer...\n");
+    uint8_t* dst = (uint8_t*)malloc(51640u + 1u);
+    CHECK(dst != NULL);
+    if (!dst) {
+        return;
+    }
+    memset(dst, 0xCC, 51640u);
+    dst[51640u] = '\0';
+
+    fb_dstorage_req_view_t req;
+    memset(&req, 0, sizeof(req));
+    req.file_path = L"common.rpf";
+    req.file_offset = 0x00643650ull;
+    req.uncomp_size = 51640u;
+    req.codec_hint = 1u;
+    req.dst_ptr = dst;
+    req.dst_size = 51640u;
+
+    int hit = cb->on_dstorage_read(&req);
+    CHECK(hit == 1);
+    if (hit == 1) {
+        const char* txt = (const char*)dst;
+        CHECK(strstr(txt, "defaultmotionblur.fpv.strength") != NULL);
+        CHECK(strstr(txt, "0.05") != NULL);
+        CHECK(strstr(txt, "motionblur.fpv.MBLowCameraRotSpeedScale 0.375") != NULL);
+        CHECK(strstr(txt, "motionblur.fpv.MBHighCameraRotSpeedScale 0.15") != NULL);
+    }
+    free(dst);
+
+    /* Also verify full asset fits exact 117,176 B buffer */
+    uint8_t* full_dst = (uint8_t*)malloc(117176u);
+    CHECK(full_dst != NULL);
+    if (full_dst) {
+        memset(full_dst, 0xCC, 117176u);
+        req.file_offset = 0x00640000ull;
+        req.uncomp_size = 117176u;
+        req.dst_ptr = full_dst;
+        req.dst_size = 117176u;
+        CHECK(cb->on_dstorage_read(&req) == 1);
+        free(full_dst);
+    }
+
+    /* And verify PSO 0x006C6000 fits exact 54,804 B buffer */
+    uint8_t* pso_dst = (uint8_t*)malloc(54804u);
+    CHECK(pso_dst != NULL);
+    if (pso_dst) {
+        memset(pso_dst, 0xCC, 54804u);
+        req.file_path = L"data.rpf";
+        req.file_offset = 0x006C6000ull;
+        req.uncomp_size = 54804u;
+        req.dst_ptr = pso_dst;
+        req.dst_size = 54804u;
+        CHECK(cb->on_dstorage_read(&req) == 1);
+        free(pso_dst);
+    }
+}
+
 static void test_scenario_a_full_host(
     fb_attach_host_fn attach_fn,
     const wchar_t*    mods_dir,
-    const wchar_t*    expect_dir)
+    const wchar_t*    expect_dir,
+    int               size_preserve_check)
 {
     printf("\n[Scenario A] Full Tier 0+1+2 Host + Native fpv_toggle.fbplugin.dll\n");
     reset_logs();
@@ -648,7 +707,9 @@ static void test_scenario_a_full_host(
     CHECK(cb.on_frame_begin != NULL && cb.on_frame_present != NULL);
     CHECK(cb.on_input_event != NULL && cb.on_shutdown != NULL);
 
-    if (expect_dir) {
+    if (size_preserve_check) {
+        verify_size_preserve_visualsettings(&cb);
+    } else if (expect_dir) {
         verify_real_bundle_against_expect_dir(&cb, expect_dir);
     } else {
         verify_synthetic_bundle_io(&cb);
@@ -714,6 +775,8 @@ static void test_scenario_a_full_host(
 
     cb.on_shutdown();
     CHECK(engine_read_u32(DIRECTOR_VA) == 0u);
+    CHECK(logs_contain(FB_LOG_INFO, "Telemetry summary:", "dstorage_hits="));
+    CHECK(logs_contain(FB_LOG_INFO, "First DirectStorage hit:", NULL));
 }
 
 static void test_scenario_b_tier0_only(fb_attach_host_fn attach_fn, const wchar_t* mods_dir) {
@@ -780,6 +843,7 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t plugin_path[MAX_PATH * 2];
     const wchar_t* mods_dir_arg = NULL;
     const wchar_t* expect_dir_arg = NULL;
+    int size_preserve_check = 0;
 
     swprintf(core_path, sizeof(core_path) / sizeof(core_path[0]), L"%ls\\fireball_core.dll", exe_dir);
     swprintf(plugin_path, sizeof(plugin_path) / sizeof(plugin_path[0]), L"%ls\\fpv_toggle.fbplugin.dll", exe_dir);
@@ -793,6 +857,8 @@ int wmain(int argc, wchar_t** argv) {
             mods_dir_arg = argv[++i];
         } else if (wcscmp(argv[i], L"--expect-dir") == 0 && i + 1 < argc) {
             expect_dir_arg = argv[++i];
+        } else if (wcscmp(argv[i], L"--size-preserve-check") == 0) {
+            size_preserve_check = 1;
         }
     }
 
@@ -828,7 +894,7 @@ int wmain(int argc, wchar_t** argv) {
     CHECK(attach_fn != NULL);
     if (attach_fn) {
         test_abi_validation(attach_fn);
-        test_scenario_a_full_host(attach_fn, mods_dir, expect_dir_arg);
+        test_scenario_a_full_host(attach_fn, mods_dir, expect_dir_arg, size_preserve_check);
         test_scenario_b_tier0_only(attach_fn, mods_dir);
     }
 

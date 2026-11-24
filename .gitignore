@@ -4,6 +4,7 @@ out/
 bin/
 obj/
 target/
+Cargo.lock
 *.exe
 *.dll
 *.lib
