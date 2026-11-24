@@ -39,3 +39,18 @@ python -B fireball_cli.py --help
 # Full 8-step vertical-slice verification against D:\Games\GTA6
 python -B fireball_cli.py verify-all
 ```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option. This includes the C11 ABI headers in `include/`, so native plugins built against them may use any license.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+This license covers Fireball-Core's own source code only. It grants no rights to any game, its assets, or other third-party material.
