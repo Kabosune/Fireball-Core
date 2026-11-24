@@ -1,0 +1,494 @@
+/*
+ * fb_core.c — Native Fireball-Core runtime (`fireball_core.dll`).
+ *
+ * Pure C11 + Win32 API (zero third-party dependencies).
+ * Exports `fb_attach_host()` per `include/fireball_host.h` (FB_HOST_ABI_VERSION = 1).
+ */
+
+#include "fireball_host.h"
+#include "fireball_plugin.h"
+#include "fb_bundle.h"
+#include "fb_plugins.h"
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct fb_overlay_handle {
+    const uint8_t* data;
+    uint64_t       size;
+} fb_overlay_handle_t;
+
+typedef struct fb_core_state {
+    int                 attached;
+    SRWLOCK             lock;
+    fb_host_api_v1_t    host_api;
+    char                host_name_copy[128];
+    char                host_version_copy[64];
+    char                game_root_utf8[512];
+    size_t              game_root_utf8_len;
+    fb_bundle_t         bundle;
+    int                 has_bundle;
+    fb_plugin_manager_t plugin_mgr;
+} fb_core_state_t;
+
+static fb_core_state_t g_core = {
+    .attached = 0,
+    .lock = SRWLOCK_INIT
+};
+
+static void core_log(int level, const char* subsystem, const char* msg) {
+    if (g_core.host_api.log) {
+        g_core.host_api.log(level, subsystem ? subsystem : "fireball-core", msg ? msg : "");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Virtualized loose-file overlay handle callbacks (`on_file_open`)
+ * --------------------------------------------------------------------------- */
+
+static int64_t fb_overlay_read_at(void* user_ctx, uint64_t offset, void* dst, uint64_t len) {
+    fb_overlay_handle_t* h = (fb_overlay_handle_t*)user_ctx;
+    if (!h) {
+        return (int64_t)FB_ERR_INVALID_ARG;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (!dst) {
+        return (int64_t)FB_ERR_INVALID_ARG;
+    }
+    if (offset >= h->size) {
+        return 0;
+    }
+    uint64_t avail = h->size - offset;
+    uint64_t to_copy = (len < avail) ? len : avail;
+    memcpy(dst, h->data + offset, (size_t)to_copy);
+    return (int64_t)to_copy;
+}
+
+static void fb_overlay_close(void* user_ctx) {
+    free(user_ctx);
+}
+
+/* ---------------------------------------------------------------------------
+ * Host callbacks exposed via `fb_modcore_callbacks_v1_t`
+ * --------------------------------------------------------------------------- */
+
+static int fb_cb_on_file_open(const wchar_t* rel_path, fb_io_override_desc_t* out_desc) {
+    if (!rel_path || !out_desc) {
+        return 0;
+    }
+
+    AcquireSRWLockShared(&g_core.lock);
+    if (!g_core.attached || !g_core.has_bundle || g_core.bundle.ov_count == 0) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    char norm_path[1024];
+    int norm_len = fb_normalize_wide_path(
+        rel_path,
+        g_core.game_root_utf8,
+        g_core.game_root_utf8_len,
+        norm_path,
+        sizeof(norm_path));
+    if (norm_len <= 0) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    const fb_bundle_overlay_entry_t* entry = fb_bundle_find_overlay(&g_core.bundle, norm_path, (size_t)norm_len);
+    if (!entry) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    fb_overlay_handle_t* handle = (fb_overlay_handle_t*)malloc(sizeof(fb_overlay_handle_t));
+    if (!handle) {
+        ReleaseSRWLockShared(&g_core.lock);
+        core_log(FB_LOG_ERROR, "fireball-core", "Out of memory allocating overlay handle in on_file_open");
+        return 0;
+    }
+    handle->data = g_core.bundle.raw_data + entry->payload_offset;
+    handle->size = entry->payload_size;
+
+    out_desc->virtual_size = entry->payload_size;
+    out_desc->user_ctx = handle;
+    out_desc->read_at = fb_overlay_read_at;
+    out_desc->close = fb_overlay_close;
+
+    ReleaseSRWLockShared(&g_core.lock);
+    return 1;
+}
+
+static int fb_cb_on_dstorage_read(const fb_dstorage_req_view_t* req) {
+    if (!req || !req->file_path) {
+        return 0;
+    }
+
+    AcquireSRWLockShared(&g_core.lock);
+    if (!g_core.attached || !g_core.has_bundle || g_core.bundle.ds_count == 0) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    char norm_path[1024];
+    int norm_len = fb_normalize_wide_path(
+        req->file_path,
+        g_core.game_root_utf8,
+        g_core.game_root_utf8_len,
+        norm_path,
+        sizeof(norm_path));
+    if (norm_len <= 0) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    const fb_bundle_dstorage_entry_t* entry = fb_bundle_find_dstorage(
+        &g_core.bundle,
+        norm_path,
+        (size_t)norm_len,
+        req->file_offset,
+        req->uncomp_size);
+    if (!entry) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    /* Enforce destination buffer bounds strictly before touching dst_ptr */
+    if (!req->dst_ptr || req->dst_size < entry->payload_size) {
+        char msg[512];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "on_dstorage_read('%s' @ 0x%llX): destination buffer too small (%u B < %u B patched payload); passing through safely",
+            norm_path,
+            (unsigned long long)req->file_offset,
+            req->dst_size,
+            entry->payload_size);
+        ReleaseSRWLockShared(&g_core.lock);
+        core_log(FB_LOG_WARN, "fireball-core", msg);
+        return 0;
+    }
+
+    memcpy(req->dst_ptr, g_core.bundle.raw_data + entry->payload_offset, entry->payload_size);
+
+    /* If patched payload shrank relative to requested uncomp_size, zero-pad the remainder cleanly */
+    if (req->uncomp_size > entry->payload_size && req->uncomp_size <= req->dst_size) {
+        memset(
+            (uint8_t*)req->dst_ptr + entry->payload_size,
+            0,
+            (size_t)(req->uncomp_size - entry->payload_size));
+    }
+
+    ReleaseSRWLockShared(&g_core.lock);
+    return 1;
+}
+
+static int fb_cb_on_shader_load(
+    const uint8_t container_blake3[32],
+    const uint8_t dxbc_digest[16],
+    const char*   effect_name_or_null,
+    const void**  out_dxil,
+    size_t*       out_size)
+{
+    (void)container_blake3;
+    (void)dxbc_digest;
+    (void)effect_name_or_null;
+    (void)out_dxil;
+    (void)out_size;
+    return 0;
+}
+
+static int fb_cb_on_bvh_rehydrate(uint64_t archetype_h64, uint64_t drawable_h64) {
+    (void)archetype_h64;
+    (void)drawable_h64;
+    return 0;
+}
+
+static void fb_cb_on_frame_begin(uint64_t frame_index, double dt_sec) {
+    fb_frame_event_v1_t ev;
+    ev.frame_index = frame_index;
+    ev.dt_sec = dt_sec;
+
+    AcquireSRWLockShared(&g_core.lock);
+    if (g_core.attached) {
+        fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_FRAME_BEGIN, &ev);
+    }
+    ReleaseSRWLockShared(&g_core.lock);
+}
+
+static void fb_cb_on_frame_present(void* d3d12_swapchain_or_null) {
+    AcquireSRWLockShared(&g_core.lock);
+    if (g_core.attached) {
+        fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_FRAME_PRESENT, d3d12_swapchain_or_null);
+    }
+    ReleaseSRWLockShared(&g_core.lock);
+}
+
+static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
+    if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t)) {
+        return 0;
+    }
+    int consumed = 0;
+    AcquireSRWLockShared(&g_core.lock);
+    if (g_core.attached) {
+        consumed = fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_INPUT_EVENT, ev);
+    }
+    ReleaseSRWLockShared(&g_core.lock);
+    return consumed;
+}
+
+static void fb_cb_on_shutdown(void) {
+    AcquireSRWLockExclusive(&g_core.lock);
+    if (!g_core.attached) {
+        ReleaseSRWLockExclusive(&g_core.lock);
+        return;
+    }
+    core_log(FB_LOG_INFO, "fireball-core", "Shutting down Fireball-Core runtime...");
+    fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
+    if (g_core.has_bundle) {
+        fb_bundle_free(&g_core.bundle);
+        g_core.has_bundle = 0;
+    }
+    memset(&g_core.host_api, 0, sizeof(g_core.host_api));
+    g_core.game_root_utf8[0] = '\0';
+    g_core.game_root_utf8_len = 0;
+    g_core.attached = 0;
+    ReleaseSRWLockExclusive(&g_core.lock);
+}
+
+static int fb_cb_on_rage_vfs_open(const char* vfs_uri, fb_io_override_desc_t* out_desc) {
+    (void)vfs_uri;
+    (void)out_desc;
+    return 0;
+}
+
+static int fb_cb_on_rage_datafile_register(const char* file_type, const char* vfs_uri) {
+    (void)file_type;
+    (void)vfs_uri;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Core services exposed to native plugins via `fb_core_services_v1_t`
+ * --------------------------------------------------------------------------- */
+
+static void fb_svc_log(const char* mod_id, int level, const char* msg) {
+    core_log(level, mod_id ? mod_id : "plugin", msg ? msg : "");
+}
+
+static int fb_svc_config_get_json(const char* mod_id, char* buf, size_t cap) {
+    if (!mod_id || !buf || cap == 0) {
+        return FB_ERR_INVALID_ARG;
+    }
+    if (!g_core.has_bundle) {
+        return FB_ERR_NOT_FOUND;
+    }
+    const fb_bundle_plugin_cfg_entry_t* e = fb_bundle_find_plugin_cfg(&g_core.bundle, mod_id, strlen(mod_id));
+    if (!e) {
+        return FB_ERR_NOT_FOUND;
+    }
+    if ((size_t)e->json_len + 1u > cap) {
+        return FB_ERR_INVALID_ARG;
+    }
+    memcpy(buf, g_core.bundle.raw_data + e->json_offset, (size_t)e->json_len + 1u);
+    return FB_OK;
+}
+
+static int fb_svc_register_event_listener(uint32_t event_id, fb_event_fn_t fn, void* user_ctx) {
+    return fb_plugin_mgr_add_listener(&g_core.plugin_mgr, event_id, fn, user_ctx);
+}
+
+static int fb_svc_poll_key_state(uint32_t device_kind, uint32_t code) {
+    if ((g_core.host_api.capabilities & FB_CAP_INPUT_EVENTS) == 0 || !g_core.host_api.poll_key_state) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    return g_core.host_api.poll_key_state(device_kind, code);
+}
+
+static int fb_svc_vfs_read_file(const char* vfs_uri, void** out_buf, size_t* out_len) {
+    (void)vfs_uri;
+    (void)out_buf;
+    (void)out_len;
+    return FB_ERR_UNSUPPORTED;
+}
+
+static void fb_svc_vfs_free_buffer(void* buf) {
+    free(buf);
+}
+
+static void* fb_svc_resolve_engine_symbol(const char* symbol_name) {
+    if (!symbol_name) {
+        return NULL;
+    }
+    if ((g_core.host_api.capabilities & FB_CAP_RAGE_SYMBOL_REG) == 0 || !g_core.host_api.resolve_symbol) {
+        return NULL;
+    }
+    return g_core.host_api.resolve_symbol(symbol_name);
+}
+
+static void* fb_svc_get_store_singleton(const char* store_name) {
+    (void)store_name;
+    return NULL;
+}
+
+static int fb_svc_title_mem_read_u32(uint64_t title_va, uint32_t* out_value) {
+    if (!out_value) {
+        return FB_ERR_INVALID_ARG;
+    }
+    if ((g_core.host_api.capabilities & FB_CAP_TITLE_MEM_RW) == 0 || !g_core.host_api.title_mem_read_u32) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    return g_core.host_api.title_mem_read_u32(title_va, out_value);
+}
+
+static int fb_svc_title_mem_write_u32(uint64_t title_va, uint32_t value) {
+    if ((g_core.host_api.capabilities & FB_CAP_TITLE_MEM_RW) == 0 || !g_core.host_api.title_mem_write_u32) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    return g_core.host_api.title_mem_write_u32(title_va, value);
+}
+
+/* ---------------------------------------------------------------------------
+ * Primary DLL export: `fb_attach_host`
+ * --------------------------------------------------------------------------- */
+
+FB_API int fb_attach_host(
+    const fb_host_api_v1_t*    host_api,
+    fb_modcore_callbacks_v1_t* out_callbacks)
+{
+    if (!host_api || !out_callbacks) {
+        return FB_ERR_INVALID_ARG;
+    }
+    if (host_api->abi_version != FB_HOST_ABI_VERSION || host_api->struct_size != sizeof(fb_host_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (out_callbacks->struct_size != 0 && out_callbacks->struct_size != sizeof(fb_modcore_callbacks_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+
+    AcquireSRWLockExclusive(&g_core.lock);
+
+    if (g_core.attached) {
+        /* Cleanly tear down any previous attachment before re-attaching */
+        fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
+        if (g_core.has_bundle) {
+            fb_bundle_free(&g_core.bundle);
+            g_core.has_bundle = 0;
+        }
+        g_core.attached = 0;
+    }
+
+    g_core.host_api = *host_api;
+    snprintf(g_core.host_name_copy, sizeof(g_core.host_name_copy), "%s", host_api->host_name ? host_api->host_name : "unknown");
+    snprintf(g_core.host_version_copy, sizeof(g_core.host_version_copy), "%s", host_api->host_version ? host_api->host_version : "0.0.0");
+    g_core.host_api.host_name = g_core.host_name_copy;
+    g_core.host_api.host_version = g_core.host_version_copy;
+
+    /* Normalize game_root_dir for stripping absolute paths in on_file_open / on_dstorage_read */
+    g_core.game_root_utf8[0] = '\0';
+    g_core.game_root_utf8_len = 0;
+    if (host_api->game_root_dir && host_api->game_root_dir[0] != L'\0') {
+        int gl = fb_normalize_wide_path(host_api->game_root_dir, NULL, 0, g_core.game_root_utf8, sizeof(g_core.game_root_utf8));
+        if (gl > 0) {
+            g_core.game_root_utf8_len = (size_t)gl;
+        }
+    }
+
+    fb_plugin_mgr_init(&g_core.plugin_mgr);
+
+    {
+        char caps_str[512];
+        fb_format_caps(g_core.host_api.capabilities, caps_str, sizeof(caps_str));
+        char msg[768];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "Attached to host '%s' v%s (ABI v%u, caps=[%s])",
+            g_core.host_api.host_name,
+            g_core.host_api.host_version,
+            g_core.host_api.abi_version,
+            caps_str);
+        core_log(FB_LOG_INFO, "fireball-core", msg);
+    }
+
+    /* Load compiled patch bundle (`<mods_root_dir>\fireball_bundle.fbin`) if present */
+    if (host_api->mods_root_dir && host_api->mods_root_dir[0] != L'\0') {
+        wchar_t bundle_path[MAX_PATH * 2];
+        int n = swprintf(
+            bundle_path,
+            sizeof(bundle_path) / sizeof(bundle_path[0]),
+            L"%ls\\fireball_bundle.fbin",
+            host_api->mods_root_dir);
+        if (n > 0) {
+            char err_buf[256];
+            err_buf[0] = '\0';
+            int brc = fb_bundle_load_file(bundle_path, &g_core.bundle, err_buf, sizeof(err_buf));
+            if (brc == FB_OK) {
+                g_core.has_bundle = 1;
+                char msg[512];
+                snprintf(
+                    msg,
+                    sizeof(msg),
+                    "Loaded fireball_bundle.fbin (%zu B): %u DirectStorage entries, %u loose overlays, %u plugin configs",
+                    g_core.bundle.raw_size,
+                    g_core.bundle.ds_count,
+                    g_core.bundle.ov_count,
+                    g_core.bundle.cfg_count);
+                core_log(FB_LOG_INFO, "fireball-core", msg);
+            } else if (brc == FB_ERR_NOT_FOUND) {
+                core_log(FB_LOG_INFO, "fireball-core", "No fireball_bundle.fbin found in mods_root_dir; continuing without compiled patch bundle");
+            } else {
+                char msg[512];
+                snprintf(msg, sizeof(msg), "Failed to load fireball_bundle.fbin: %s (rc=%d)", err_buf, brc);
+                core_log(FB_LOG_ERROR, "fireball-core", msg);
+            }
+        }
+    }
+
+    /* Discover and initialize native plugins (`*.fbplugin.dll`) */
+    fb_core_services_v1_t services;
+    memset(&services, 0, sizeof(services));
+    services.struct_size = (uint32_t)sizeof(services);
+    services.abi_version = FB_PLUGIN_ABI_VERSION;
+    services.active_host_caps = g_core.host_api.capabilities;
+    services.log = fb_svc_log;
+    services.config_get_json = fb_svc_config_get_json;
+    services.register_event_listener = fb_svc_register_event_listener;
+    services.poll_key_state = fb_svc_poll_key_state;
+    services.vfs_read_file = fb_svc_vfs_read_file;
+    services.vfs_free_buffer = fb_svc_vfs_free_buffer;
+    services.resolve_engine_symbol = fb_svc_resolve_engine_symbol;
+    services.get_store_singleton = fb_svc_get_store_singleton;
+    services.title_mem_read_u32 = fb_svc_title_mem_read_u32;
+    services.title_mem_write_u32 = fb_svc_title_mem_write_u32;
+
+    if (host_api->mods_root_dir && host_api->mods_root_dir[0] != L'\0') {
+        fb_plugin_mgr_discover_and_load(&g_core.plugin_mgr, host_api->mods_root_dir, &g_core.host_api, &services);
+    }
+
+    /* Populate host callbacks */
+    memset(out_callbacks, 0, sizeof(*out_callbacks));
+    out_callbacks->struct_size = (uint32_t)sizeof(*out_callbacks);
+    out_callbacks->abi_version = FB_HOST_ABI_VERSION;
+    out_callbacks->on_file_open = fb_cb_on_file_open;
+    out_callbacks->on_dstorage_read = fb_cb_on_dstorage_read;
+    out_callbacks->on_shader_load = fb_cb_on_shader_load;
+    out_callbacks->on_bvh_rehydrate = fb_cb_on_bvh_rehydrate;
+    out_callbacks->on_frame_begin = fb_cb_on_frame_begin;
+    out_callbacks->on_frame_present = fb_cb_on_frame_present;
+    out_callbacks->on_input_event = fb_cb_on_input_event;
+    out_callbacks->on_shutdown = fb_cb_on_shutdown;
+    out_callbacks->on_rage_vfs_open = fb_cb_on_rage_vfs_open;
+    out_callbacks->on_rage_datafile_register = fb_cb_on_rage_datafile_register;
+
+    g_core.attached = 1;
+    ReleaseSRWLockExclusive(&g_core.lock);
+    return FB_OK;
+}

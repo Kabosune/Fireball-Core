@@ -22,6 +22,7 @@ if _ROOT_DIR not in sys.path:
 
 from fireball.abi import verify_c11_headers  # noqa: E402
 from fireball.archive_reader import parse_int_hex, read_paged_zlib_at, read_single_zlib_chunk_at  # noqa: E402
+from fireball.bundle import build_patch_bundle  # noqa: E402
 from fireball.mergers import merge_kv_bytes, merge_xml_bytes  # noqa: E402
 from fireball.mock_host import run_mock_host_suite  # noqa: E402
 from fireball.mod_source import load_manifest, open_mod_source, pack_mod_to_zip  # noqa: E402
@@ -294,6 +295,28 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_bundle(args: argparse.Namespace) -> int:
+    _check_out_not_in_game_dir(args.out, args.game_dir)
+    mod_paths = args.mod if args.mod else [DEFAULT_MOD_DIR]
+    extra_overlays: Dict[str, bytes] = {}
+    for spec in args.overlay or []:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --overlay '{spec}': expected TARGET_REL_PATH=SOURCE_FILE")
+        target_rel, src_file = spec.split("=", 1)
+        with open(src_file, "rb") as rf:
+            extra_overlays[target_rel] = rf.read()
+    rep = build_patch_bundle(
+        mod_paths,
+        args.game_dir,
+        args.out,
+        bundle_filename=args.bundle_name,
+        extra_overlays=extra_overlays or None,
+        tools_dir=args.tools_dir,
+    )
+    print(json.dumps(rep, indent=2))
+    return 0
+
+
 def cmd_verify_all(args: argparse.Namespace) -> int:
     """Run the full end-to-end vertical-slice test suite in one command."""
     _check_out_not_in_game_dir(args.out, args.game_dir)
@@ -487,6 +510,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim = sub.add_parser("simulate", help="Run Mock VIctory HLE Host + fpv_toggle state-machine tests.")
     p_sim.add_argument("--mod", default=DEFAULT_MOD_DIR, help="Loose mod folder or .gta6mod ZIP")
 
+    p_bun = sub.add_parser(
+        "build-bundle",
+        help="Compile one or more mods into a deterministic fireball_bundle.fbin + provenance JSON.",
+    )
+    p_bun.add_argument(
+        "--mod",
+        action="append",
+        default=None,
+        help="Mod folder or .gta6mod ZIP (repeatable in load order; default: examples/fpv_unlocker)",
+    )
+    p_bun.add_argument(
+        "--overlay",
+        action="append",
+        default=None,
+        help="Optional extra loose-file overlay as TARGET_REL_PATH=LOCAL_SOURCE_FILE (repeatable)",
+    )
+    p_bun.add_argument(
+        "--bundle-name",
+        default="fireball_bundle.fbin",
+        help="Output bundle filename under --out (default: fireball_bundle.fbin)",
+    )
+
     p_all = sub.add_parser("verify-all", help="Run the full end-to-end vertical-slice verification suite.")
     p_all.add_argument("--mod", default=DEFAULT_MOD_DIR, help="Loose mod folder (default: examples/fpv_unlocker)")
     return p
@@ -501,6 +546,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "apply": cmd_apply,
         "chks-probe": cmd_chks_probe,
         "simulate": cmd_simulate,
+        "build-bundle": cmd_build_bundle,
         "verify-all": cmd_verify_all,
     }
     return dispatch[args.cmd](args)

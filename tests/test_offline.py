@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -14,6 +17,22 @@ if ROOT not in sys.path:
 
 import fireball_cli  # noqa: E402
 from fireball.abi import verify_c11_headers  # noqa: E402
+from fireball.bundle import (  # noqa: E402
+    FB_BUNDLE_MAGIC,
+    FB_BUNDLE_VERSION,
+    FB_DS_FLAG_FULL_ASSET,
+    FB_DS_FLAG_PAGE_SLICE,
+    FB_DS_FLAG_TEXT_PATCH,
+    BundleDStorageEntry,
+    BundleOverlayEntry,
+    BundlePluginConfigEntry,
+    CompiledBundle,
+    build_patch_bundle,
+    dstorage_key_hash,
+    normalize_rel_path,
+    parse_bundle,
+    serialize_bundle,
+)
 from fireball.mergers import merge_kv_bytes, merge_xml_bytes  # noqa: E402
 from fireball.mock_host import run_mock_host_suite  # noqa: E402
 from fireball.mod_source import load_manifest, open_mod_source, pack_mod_to_zip  # noqa: E402
@@ -52,7 +71,7 @@ class TestFireballOffline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             zip_path = os.path.join(td, "fpv_unlocker.gta6mod")
             info = pack_mod_to_zip(mod_dir, zip_path)
-            self.assertEqual(info["file_count"], 7)
+            self.assertEqual(info["file_count"], 8)
 
             with open_mod_source(mod_dir) as s_loose, open_mod_source(zip_path) as s_zip:
                 m_loose = load_manifest(s_loose)
@@ -103,6 +122,145 @@ class TestFireballOffline(unittest.TestCase):
         self.assertEqual(kv_res.changes_applied, 2)
         self.assertIn(b"motionblur.fpv.MBLowCameraRotSpeedScale 0.375", kv_res.patched_bytes)
         self.assertIn(b"defaultmotionblur.fpv.strength\t\t0.05", kv_res.patched_bytes)
+
+    def test_bundle_serialize_parse_determinism_and_normalization(self) -> None:
+        self.assertEqual(normalize_rel_path(r".\Pack\Story000\Story000.RPF"), "pack/story000/story000.rpf")
+        with self.assertRaises(ValueError):
+            normalize_rel_path("../escape.rpf")
+
+        e1 = BundleDStorageEntry(
+            archive_path="DATA.RPF",
+            file_offset=0x006C6000,
+            orig_uncomp_size=16,
+            payload=b"PSIN0123456789ab",
+            flags=FB_DS_FLAG_FULL_ASSET | FB_DS_FLAG_PAGE_SLICE,
+        )
+        e2 = BundleDStorageEntry(
+            archive_path="common.rpf",
+            file_offset=0x0003BA30,
+            orig_uncomp_size=100,
+            payload=b"<Root/>",
+            flags=FB_DS_FLAG_PAGE_SLICE | FB_DS_FLAG_TEXT_PATCH,
+        )
+        ov = BundleOverlayEntry(rel_path=r"Data\Loose\Test.txt", payload=b"hello overlay")
+        cfg = BundlePluginConfigEntry(mod_id="community.fpv_unlocker", config_json='{"hotkey_vkey":86}')
+
+        # Order of input lists must not affect binary output (deterministic sorting)
+        b_a = serialize_bundle(CompiledBundle([e1, e2], [ov], [cfg]))
+        b_b = serialize_bundle(CompiledBundle([e2, e1], [ov], [cfg]))
+        self.assertEqual(b_a, b_b)
+        magic, ver = struct.unpack_from("<II", b_a, 0)
+        self.assertEqual(magic, FB_BUNDLE_MAGIC)
+        self.assertEqual(ver, FB_BUNDLE_VERSION)
+
+        parsed = parse_bundle(b_a)
+        self.assertEqual(len(parsed.dstorage_entries), 2)
+        self.assertEqual(parsed.dstorage_entries[0].archive_path, "common.rpf")
+        self.assertEqual(parsed.dstorage_entries[1].archive_path, "data.rpf")
+        self.assertEqual(parsed.dstorage_entries[1].key_hash, dstorage_key_hash("data.rpf", 0x006C6000, 16))
+        self.assertEqual(parsed.overlay_entries[0].rel_path, "data/loose/test.txt")
+        self.assertEqual(parsed.overlay_entries[0].payload, b"hello overlay")
+        self.assertEqual(parsed.plugin_configs[0].mod_id, "community.fpv_unlocker")
+
+        # Corrupted payload must fail CRC32 check
+        corrupted = bytearray(b_a)
+        corrupted[-16] ^= 0xFF
+        with self.assertRaises(ValueError):
+            parse_bundle(bytes(corrupted))
+
+    def test_build_bundle_multimod_load_order_and_multipage_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            game_dir = os.path.join(td, "game")
+            out_dir = os.path.join(td, "out")
+            os.makedirs(game_dir, exist_ok=True)
+
+            # Build a synthetic 2-page (64 KiB + tail) 78 DA zlib stream in fake common.rpf
+            page0 = b"<!-- " + (b"A" * (65536 - 10)) + b" -->\n"
+            self.assertEqual(len(page0), 65536)
+            page1 = (
+                b'<Root>\n'
+                b'  <UseFirstPersonCameraMatrix value="false" />\n'
+                b'  <ExtraFlag value="off" />\n'
+                b'</Root>\n'
+            )
+            c0 = zlib.compress(page0, level=9)
+            c1 = zlib.compress(page1, level=9)
+            self.assertEqual(c0[:2], b"\x78\xda")
+            self.assertEqual(c1[:2], b"\x78\xda")
+
+            # Align page1 to 16-byte boundary after page0 at offset 0x100
+            arch = bytearray(0x100)
+            arch.extend(c0)
+            while len(arch) % 16 != 0:
+                arch.append(0)
+            page1_off = len(arch)
+            arch.extend(c1)
+            with open(os.path.join(game_dir, "common.rpf"), "wb") as wf:
+                wf.write(arch)
+
+            # Mod A patches UseFirstPersonCameraMatrix and provides an overlay + plugin config
+            mod_a = os.path.join(td, "mod_a")
+            os.makedirs(os.path.join(mod_a, "patches"), exist_ok=True)
+            os.makedirs(os.path.join(mod_a, "overlays", "data"), exist_ok=True)
+            with open(os.path.join(mod_a, "mod.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    f'[mod]\nid = "test.mod_a"\nname = "Mod A"\nversion = "1.0.0"\n'
+                    f'target_game_version = "1.0.2.1"\nmin_fireball_abi = 1\n'
+                    f'[[patches.xml]]\nid = "xml_a"\ntarget = "common:/test.meta"\narchive = "common.rpf"\n'
+                    f'archive_offset = "0x100"\npage_offset = "0x{page1_off:X}"\npatch = "patches/a.toml"\n'
+                    f'[[plugins]]\nid = "demo"\nentry = "none.py"\n[plugins.config]\nhotkey_vkey = 86\n'
+                )
+            with open(os.path.join(mod_a, "patches", "a.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[[ops]]\nop = "set_attr"\ntag = "UseFirstPersonCameraMatrix"\nattr = "value"\n'
+                    'expected_old = "false"\nvalue = "true"\nexpected_matches = 1\n'
+                )
+            with open(os.path.join(mod_a, "overlays", "data", "hello.txt"), "wb") as wf:
+                wf.write(b"from mod A")
+
+            # Mod B loads after Mod A, patches ExtraFlag in the same XML, and overrides the overlay
+            mod_b_dir = os.path.join(td, "mod_b_src")
+            os.makedirs(os.path.join(mod_b_dir, "patches"), exist_ok=True)
+            os.makedirs(os.path.join(mod_b_dir, "overlays", "data"), exist_ok=True)
+            with open(os.path.join(mod_b_dir, "mod.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    f'[mod]\nid = "test.mod_b"\nname = "Mod B"\nversion = "1.0.0"\n'
+                    f'target_game_version = "1.0.2.1"\nmin_fireball_abi = 1\n'
+                    f'[[patches.xml]]\nid = "xml_b"\ntarget = "common:/test.meta"\narchive = "common.rpf"\n'
+                    f'archive_offset = "0x100"\npage_offset = "0x{page1_off:X}"\npatch = "patches/b.toml"\n'
+                )
+            with open(os.path.join(mod_b_dir, "patches", "b.toml"), "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[[ops]]\nop = "set_attr"\ntag = "ExtraFlag"\nattr = "value"\n'
+                    'expected_old = "off"\nvalue = "on"\nexpected_matches = 1\n'
+                )
+            with open(os.path.join(mod_b_dir, "overlays", "data", "hello.txt"), "wb") as wf:
+                wf.write(b"from mod B")
+            mod_b_zip = os.path.join(td, "mod_b.gta6mod")
+            pack_mod_to_zip(mod_b_dir, mod_b_zip)
+
+            rep = build_patch_bundle([mod_a, mod_b_zip], game_dir, out_dir)
+            self.assertEqual(rep["dstorage_entry_count"], 2)  # full asset + modified page[1]
+            self.assertEqual(rep["overlay_entry_count"], 1)
+            self.assertEqual(rep["plugin_config_count"], 1)
+            self.assertTrue(os.path.isfile(rep["bundle_file"]))
+            self.assertTrue(os.path.isfile(rep["provenance_file"]))
+
+            with open(rep["bundle_file"], "rb") as rf:
+                parsed = parse_bundle(rf.read())
+            by_off = {e.file_offset: e for e in parsed.dstorage_entries}
+            self.assertIn(0x100, by_off)
+            self.assertIn(page1_off, by_off)
+            # Both Mod A and Mod B edits must appear in both full asset and page[1] slice
+            for e in (by_off[0x100], by_off[page1_off]):
+                self.assertIn(b'UseFirstPersonCameraMatrix value="true"', e.payload)
+                self.assertIn(b'ExtraFlag value="on"', e.payload)
+            self.assertEqual(by_off[page1_off].orig_uncomp_size, len(page1))
+            self.assertEqual(parsed.overlay_entries[0].payload, b"from mod B")
+
+            with open(rep["provenance_file"], "r", encoding="utf-8") as rf:
+                prov = json.load(rf)
+            self.assertEqual(prov["total_field_changes"], 2)
 
 
 if __name__ == "__main__":

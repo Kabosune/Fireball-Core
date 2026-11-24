@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import os
 import zlib
-from typing import Tuple
+from dataclasses import dataclass
+from typing import List, Tuple
+
+
+@dataclass(frozen=True)
+class ZlibPageInfo:
+    page_index: int
+    file_offset: int
+    compressed_size: int
+    uncompressed_offset: int
+    uncompressed_size: int
+    data: bytes
 
 
 def parse_int_hex(val: object) -> int:
@@ -13,16 +24,17 @@ def parse_int_hex(val: object) -> int:
     return int(str(val), 0)
 
 
-def read_paged_zlib_at(
+def read_paged_zlib_pages_at(
     archive_path: str,
     offset: int,
     max_read_bytes: int = 4 * 1024 * 1024,
-) -> Tuple[bytes, int, int]:
+) -> Tuple[bytes, List[ZlibPageInfo], int]:
     """
     Seek to `offset` inside a read-only RPF9 archive and reassemble a single or
-    multi-page (64 KiB) unencrypted `78 DA` zlib asset without reading the full RPF.
+    multi-page (64 KiB) unencrypted `78 DA` zlib asset without reading the full RPF,
+    returning per-page file offsets and uncompressed slices.
 
-    Returns (decompressed_bytes, page_count, end_file_offset).
+    Returns (decompressed_bytes, page_infos, end_file_offset).
     """
     if not os.path.isfile(archive_path):
         raise FileNotFoundError(f"Game archive not found: {archive_path}")
@@ -42,6 +54,7 @@ def read_paged_zlib_at(
         )
 
     out = bytearray()
+    page_infos: List[ZlibPageInfo] = []
     pos = 0
     pages = 0
     n = len(window)
@@ -53,7 +66,18 @@ def read_paged_zlib_at(
                 f"Incomplete zlib stream at {os.path.basename(archive_path)} @ 0x{offset + pos:08X}"
             )
         consumed = (n - pos) - len(d.unused_data)
+        uoff = len(out)
         out.extend(chunk)
+        page_infos.append(
+            ZlibPageInfo(
+                page_index=pages,
+                file_offset=offset + pos,
+                compressed_size=consumed,
+                uncompressed_offset=uoff,
+                uncompressed_size=len(chunk),
+                data=chunk,
+            )
+        )
         pages += 1
         pos += consumed
         # RPF9 paged assets split into 65,536-byte uncompressed pages aligned to 16-byte boundaries.
@@ -68,7 +92,22 @@ def read_paged_zlib_at(
         else:
             break
 
-    return bytes(out), pages, offset + pos
+    return bytes(out), page_infos, offset + pos
+
+
+def read_paged_zlib_at(
+    archive_path: str,
+    offset: int,
+    max_read_bytes: int = 4 * 1024 * 1024,
+) -> Tuple[bytes, int, int]:
+    """
+    Seek to `offset` inside a read-only RPF9 archive and reassemble a single or
+    multi-page (64 KiB) unencrypted `78 DA` zlib asset without reading the full RPF.
+
+    Returns (decompressed_bytes, page_count, end_file_offset).
+    """
+    raw, page_infos, end_off = read_paged_zlib_pages_at(archive_path, offset, max_read_bytes=max_read_bytes)
+    return raw, len(page_infos), end_off
 
 
 def read_single_zlib_chunk_at(archive_path: str, offset: int, max_read_bytes: int = 512 * 1024) -> bytes:
