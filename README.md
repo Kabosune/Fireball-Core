@@ -1,6 +1,6 @@
 # Fireball-Core
 
-Mod core and mod loader for *Grand Theft Auto VI* (Project Americas / RAGE 9).
+Mod core and mod loader for *Grand Theft Auto VI* (Project Americas / RAGE 9), designed around **[Marvisak/VIctory](https://github.com/marvisak/victory)** (Rust x86-64 HLE runner) with a frozen pure-C11 host & plugin ABI.
 
 ## Companion Research Repository
 
@@ -9,4 +9,33 @@ Format specifications, VFS mount maps, and standalone read-only inspection/extra
 
 ## Scope
 - Single-player / offline modding core and mod loader architecture.
+- Strictly read-only against the user's local game install (`--game-dir` / `GTA6_DIR`, default `D:\Games\GTA6`). All scratch/patched outputs go under `--out` (default `D:\GTA6-work\fireball-fpv-test`).
 - No DRM/encryption keys, decrypted game executables, copyrighted game assets, or online/multiplayer/anti-cheat functionality.
+
+## Repository Layout
+
+- `include/fireball_host.h` — Frozen pure-C11 Host <-> Fireball-Core ABI (`FB_HOST_ABI_VERSION = 1`), covering Tier 0/1/2 capabilities (`FB_CAP_*`), `on_file_open`, `on_dstorage_read`, `on_shader_load`, `on_frame_begin`/`on_frame_present`, `on_input_event`/`poll_key_state`, `resolve_symbol`, and guarded `title_mem_read_u32`/`title_mem_write_u32`.
+- `include/fireball_plugin.h` — Frozen pure-C11 Native Plugin ABI (`FB_PLUGIN_ABI_VERSION = 1`) for `*.fbplugin.dll` plugins authored in C, C++, Rust, or Zig.
+- `examples/fpv_unlocker/` — End-to-end vertical-slice sample mod (`mod.toml`, XML/KV/PSO patch manifests, and `plugins/fpv_toggle.py` state machine).
+- `fireball/` — Python 3.13 stdlib-only Phase 0 reference core (reuses `pso_decode.py` from the companion research repo via `--tools-dir` / `GTA6_MODDING_TOOLS`):
+  - `abi.py` — Capability constants + static C11 header contract checker.
+  - `mod_source.py` — Dual-mode `VirtualModSource` (loose folder + `.gta6mod` ZIP packer/reader).
+  - `archive_reader.py` — Read-only streaming/seeking paged zlib reader.
+  - `mergers.py` — Additive XML & `visualsettings.dat` KV mergers with diffs & provenance.
+  - `pso_patcher.py` — RAGE 9 binary PSO field patcher, 7-section serializer, re-decoder verification, and empirical `CHKS +0x0C` probe.
+  - `mock_host.py` — `VIctory`-style Mock HLE Host + Tier 0-only graceful degradation suite.
+- `fireball_cli.py` — Offline Phase 0 CLI (`pack`, `validate`, `apply`, `chks-probe`, `simulate`, `verify-all`).
+- `tests/test_offline.py` — Offline `unittest` suite (runs without a game install or companion tools).
+
+## Quick Start
+
+```powershell
+# Offline unit tests (no game dump required)
+python -B -m unittest discover -s tests -v
+
+# CLI help (no game dump required)
+python -B fireball_cli.py --help
+
+# Full 8-step vertical-slice verification against D:\Games\GTA6
+python -B fireball_cli.py verify-all
+```
