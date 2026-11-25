@@ -4,7 +4,7 @@ Mod core and mod loader for *Grand Theft Auto VI* (Project Americas / RAGE 9), d
 
 ## Companion Research Repository
 
-Format specifications, VFS mount maps, and standalone read-only inspection/extraction tools live in:
+Format specifications, VFS mount maps, and standalone read-only inspection/extraction tools live in (it's a private repo, ask for access):
 - **[Project-Americas-modding-and-documentation](https://github.com/Kabosune/Project-Americas-modding-and-documentation)**
 
 ## Scope
