@@ -1,0 +1,42 @@
+# Fireball-Core helper mod — state_scan: find engine state (clock, weather) by value.
+# Research aid for the live scan (research repo: tools/state_scan_diff.py).
+#
+#   F9  -> ask VIctory for a snapshot labelled "run"     (needs VICTORY_SNAPSHOT = snapshot_dir,
+#   F10 -> ask VIctory for a snapshot labelled "paused"   diagnostics build)
+#   F11 -> run the writes listed in write_tests_path, log read-backs (Tier 2)
+# Watched RVAs (watch_path, one hex RVA per line) are logged when they change (Tier 2).
+# Tier 2 needs any [fireball.symbols] entry in victory.toml; "fb.image" = 0x0 gives the image base.
+
+[mod]
+id = "community.state_scan"
+name = "State scan (research helper)"
+version = "0.1.0"
+authors = ["Fireball-Core examples"]
+license = "MIT"
+target_game_version = "1.0.2.1"
+min_fireball_abi = 1
+required_tiers = [0]
+description = "Hotkey-driven title-memory snapshots (via VICTORY_SNAPSHOT), watched values and write tests for locating clock and weather state."
+
+[dependencies]
+requires = []
+load_after = []
+conflicts = []
+
+[[plugins]]
+id = "state_scan"
+version = "0.1.0"
+entry = "native/state_scan.c"   # native only: no Python reference (not for `fireball_cli.py simulate`)
+native_path = "bin/state_scan.fbplugin.dll"
+required_caps = ["FB_CAP_FRAME_LIFECYCLE", "FB_CAP_INPUT_EVENTS"]
+
+[plugins.config]
+snapshot_dir = 'D:\GTA6-work\T036\snaps'
+watch_path = 'D:\GTA6-work\T036\watch.txt'
+write_tests_path = 'D:\GTA6-work\T036\write_tests.txt'
+watch_log = 'D:\GTA6-work\T036\state_scan_log.csv'
+image_symbol = "fb.image"
+verify_frames = 30
+key_snap_run = 0x78       # F9
+key_snap_paused = 0x79    # F10
+key_write_test = 0x7A     # F11

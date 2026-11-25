@@ -67,6 +67,40 @@ set_target_properties(fpv_toggle_plugin PROPERTIES
 fb_apply_strict_warnings(fpv_toggle_plugin)
 
 # ---------------------------------------------------------------------------
+# 3b. Native time_weather.fbplugin.dll and state_scan.fbplugin.dll
+# ---------------------------------------------------------------------------
+add_library(time_weather_plugin SHARED
+    examples/time_weather_control/native/time_weather.c
+    examples/time_weather_control/native/time_weather_ui.c
+)
+target_compile_definitions(time_weather_plugin PRIVATE FB_BUILD_DLL)
+target_include_directories(time_weather_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(time_weather_plugin PRIVATE comctl32 user32 gdi32)
+set_target_properties(time_weather_plugin PROPERTIES
+    OUTPUT_NAME "time_weather.fbplugin"
+    PREFIX ""
+)
+fb_apply_strict_warnings(time_weather_plugin)
+
+add_library(state_scan_plugin SHARED
+    examples/state_scan/native/state_scan.c
+)
+target_compile_definitions(state_scan_plugin PRIVATE FB_BUILD_DLL)
+target_include_directories(state_scan_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(state_scan_plugin PROPERTIES
+    OUTPUT_NAME "state_scan.fbplugin"
+    PREFIX ""
+)
+fb_apply_strict_warnings(state_scan_plugin)
+
+add_executable(fireball_plugin_examples_test
+    tests/native/plugin_examples_test.c
+)
+target_include_directories(fireball_plugin_examples_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_dependencies(fireball_plugin_examples_test time_weather_plugin state_scan_plugin)
+fb_apply_strict_warnings(fireball_plugin_examples_test)
+
+# ---------------------------------------------------------------------------
 # 4. Native VIctory-style Mock Host (dynamically loads fireball_core.dll)
 # ---------------------------------------------------------------------------
 add_executable(fireball_mock_host
@@ -94,5 +128,11 @@ if(BUILD_TESTING)
         COMMAND $<TARGET_FILE:fireball_mock_host>
             --core $<TARGET_FILE:fireball_core>
             --plugin $<TARGET_FILE:fpv_toggle_plugin>
+    )
+    add_test(
+        NAME fireball_plugin_examples_native
+        COMMAND $<TARGET_FILE:fireball_plugin_examples_test>
+            --time-weather $<TARGET_FILE:time_weather_plugin>
+            --state-scan $<TARGET_FILE:state_scan_plugin>
     )
 endif()
