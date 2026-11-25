@@ -3,12 +3,18 @@
  *
  * Pure C11 + Win32 API (zero third-party dependencies).
  * Exports `fb_attach_host()` per `include/fireball_host.h` (FB_HOST_ABI_VERSION = 1).
+ * Provides built-in Mod Menu, Typed Settings Registry, and Keyboard + Gamepad Action
+ * Binding Manager to native plugins via `include/fireball_menu.h`.
  */
 
 #include "fireball_host.h"
 #include "fireball_plugin.h"
+#include "fireball_menu.h"
 #include "fb_bundle.h"
 #include "fb_plugins.h"
+#include "fb_bindings.h"
+#include "fb_settings.h"
+#include "fb_menu_ui.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -24,30 +30,35 @@ typedef struct fb_overlay_handle {
 } fb_overlay_handle_t;
 
 typedef struct fb_core_state {
-    int                 attached;
-    SRWLOCK             lock;
-    fb_host_api_v1_t    host_api;
-    char                host_name_copy[128];
-    char                host_version_copy[64];
-    char                game_root_utf8[512];
-    size_t              game_root_utf8_len;
-    fb_bundle_t         bundle;
-    int                 has_bundle;
-    fb_plugin_manager_t plugin_mgr;
+    int                   attached;
+    SRWLOCK               lock;
+    CRITICAL_SECTION      menu_lock;
+    int                   menu_lock_init;
+    fb_host_api_v1_t      host_api;
+    char                  host_name_copy[128];
+    char                  host_version_copy[64];
+    char                  game_root_utf8[512];
+    size_t                game_root_utf8_len;
+    fb_bundle_t           bundle;
+    int                   has_bundle;
+    fb_plugin_manager_t   plugin_mgr;
+    fb_binding_manager_t  bindings;
+    fb_settings_manager_t settings;
+    fb_menu_ui_t          menu_ui;
 
     /* Per-entry first-hit flags (log once per target without spamming hot loops) */
-    volatile LONG*      ds_first_hit;
-    volatile LONG*      ov_first_hit;
+    volatile LONG*        ds_first_hit;
+    volatile LONG*        ov_first_hit;
 
     /* Lock-free atomic live boot telemetry counters */
-    volatile LONG64     dstorage_calls;
-    volatile LONG64     dstorage_hits;
-    volatile LONG64     dstorage_buf_too_small;
-    volatile LONG64     file_open_calls;
-    volatile LONG64     file_open_hits;
-    volatile LONG64     input_events;
-    volatile LONG64     input_consumed;
-    volatile LONG64     frames_seen;
+    volatile LONG64       dstorage_calls;
+    volatile LONG64       dstorage_hits;
+    volatile LONG64       dstorage_buf_too_small;
+    volatile LONG64       file_open_calls;
+    volatile LONG64       file_open_hits;
+    volatile LONG64       input_events;
+    volatile LONG64       input_consumed;
+    volatile LONG64       frames_seen;
 } fb_core_state_t;
 
 static fb_core_state_t g_core = {
@@ -58,6 +69,14 @@ static fb_core_state_t g_core = {
 static void core_log(int level, const char* subsystem, const char* msg) {
     if (g_core.host_api.log) {
         g_core.host_api.log(level, subsystem ? subsystem : "fireball-core", msg ? msg : "");
+    }
+}
+
+static void fb_core_toggle_menu_action(const char* action_id, int active, void* user_ctx) {
+    (void)action_id;
+    (void)user_ctx;
+    if (active) {
+        fb_menu_ui_toggle(&g_core.menu_ui);
     }
 }
 
@@ -280,6 +299,10 @@ static void fb_cb_on_frame_begin(uint64_t frame_index, double dt_sec) {
 
     AcquireSRWLockShared(&g_core.lock);
     if (g_core.attached) {
+        EnterCriticalSection(&g_core.menu_lock);
+        fb_menu_ui_tick(&g_core.menu_ui, dt_sec);
+        LeaveCriticalSection(&g_core.menu_lock);
+
         fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_FRAME_BEGIN, &ev);
     }
     ReleaseSRWLockShared(&g_core.lock);
@@ -301,7 +324,19 @@ static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
     int consumed = 0;
     AcquireSRWLockShared(&g_core.lock);
     if (g_core.attached) {
-        consumed = fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_INPUT_EVENT, ev);
+        EnterCriticalSection(&g_core.menu_lock);
+        fb_bindings_track_input(&g_core.bindings, ev);
+        int menu_open = fb_menu_ui_is_open(&g_core.menu_ui);
+        if (menu_open) {
+            consumed = fb_menu_ui_handle_input(&g_core.menu_ui, ev);
+        } else {
+            consumed = fb_bindings_dispatch_input(&g_core.bindings, ev, 0);
+        }
+        LeaveCriticalSection(&g_core.menu_lock);
+
+        if (!consumed && !menu_open) {
+            consumed = fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_INPUT_EVENT, ev);
+        }
     }
     ReleaseSRWLockShared(&g_core.lock);
     if (consumed) {
@@ -328,6 +363,19 @@ static void fb_reset_telemetry(void) {
     g_core.frames_seen = 0;
 }
 
+static void fb_teardown_unlocked(void) {
+    fb_menu_ui_shutdown(&g_core.menu_ui);
+    fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
+    fb_bindings_free(&g_core.bindings);
+    fb_settings_free(&g_core.settings);
+    fb_free_first_hit_arrays();
+    if (g_core.has_bundle) {
+        fb_bundle_free(&g_core.bundle);
+        g_core.has_bundle = 0;
+    }
+    fb_reset_telemetry();
+}
+
 static void fb_cb_on_shutdown(void) {
     AcquireSRWLockExclusive(&g_core.lock);
     if (!g_core.attached) {
@@ -352,13 +400,7 @@ static void fb_cb_on_shutdown(void) {
         core_log(FB_LOG_INFO, "fireball-core", msg);
     }
     core_log(FB_LOG_INFO, "fireball-core", "Shutting down Fireball-Core runtime...");
-    fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
-    fb_free_first_hit_arrays();
-    if (g_core.has_bundle) {
-        fb_bundle_free(&g_core.bundle);
-        g_core.has_bundle = 0;
-    }
-    fb_reset_telemetry();
+    fb_teardown_unlocked();
     memset(&g_core.host_api, 0, sizeof(g_core.host_api));
     g_core.game_root_utf8[0] = '\0';
     g_core.game_root_utf8_len = 0;
@@ -459,6 +501,72 @@ static int fb_svc_title_mem_write_u32(uint64_t title_va, uint32_t value) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Menu / Settings / Action Binding API exposed via `fb_menu_api_v1_t`
+ * --------------------------------------------------------------------------- */
+
+static int fb_menu_svc_register_mod(const char* mod_id, const char* display_name, const char* description) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_settings_register_mod(&g_core.settings, mod_id, display_name, description);
+    if (rc == FB_OK) {
+        fb_menu_ui_rebuild(&g_core.menu_ui);
+    }
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_register_action(const fb_action_desc_v1_t* desc) {
+    EnterCriticalSection(&g_core.menu_lock);
+    if (desc && desc->mod_id) {
+        fb_settings_register_mod(&g_core.settings, desc->mod_id, NULL, NULL);
+    }
+    int rc = fb_bindings_register(&g_core.bindings, desc);
+    if (rc == FB_OK) {
+        fb_menu_ui_rebuild(&g_core.menu_ui);
+    }
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_register_setting(const fb_setting_desc_v1_t* desc) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_settings_register(&g_core.settings, desc);
+    if (rc == FB_OK) {
+        fb_menu_ui_rebuild(&g_core.menu_ui);
+    }
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_get_setting(const char* mod_id, const char* setting_id, fb_setting_value_t* out_val) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_settings_get(&g_core.settings, mod_id, setting_id, out_val);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_set_setting(const char* mod_id, const char* setting_id, const fb_setting_value_t* val, int notify) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_settings_set(&g_core.settings, mod_id, setting_id, val, notify);
+    InterlockedExchange(&g_core.menu_ui.dirty, 1);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_save_user_config(void) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_user_config_save(&g_core.settings, &g_core.bindings, NULL);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_menu_svc_is_menu_open(void) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int open = fb_menu_ui_is_open(&g_core.menu_ui);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return open;
+}
+
+/* ---------------------------------------------------------------------------
  * Primary DLL export: `fb_attach_host`
  * --------------------------------------------------------------------------- */
 
@@ -478,14 +586,14 @@ FB_API int fb_attach_host(
 
     AcquireSRWLockExclusive(&g_core.lock);
 
+    if (!g_core.menu_lock_init) {
+        InitializeCriticalSection(&g_core.menu_lock);
+        g_core.menu_lock_init = 1;
+    }
+
     if (g_core.attached) {
         /* Cleanly tear down any previous attachment before re-attaching */
-        fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
-        fb_free_first_hit_arrays();
-        if (g_core.has_bundle) {
-            fb_bundle_free(&g_core.bundle);
-            g_core.has_bundle = 0;
-        }
+        fb_teardown_unlocked();
         g_core.attached = 0;
     }
 
@@ -508,6 +616,57 @@ FB_API int fb_attach_host(
     }
 
     fb_plugin_mgr_init(&g_core.plugin_mgr);
+    fb_bindings_init(&g_core.bindings);
+    fb_settings_init(&g_core.settings);
+    fb_settings_set_config_path(&g_core.settings, host_api->mods_root_dir);
+
+    {
+        fb_menu_telemetry_ptrs_t tptrs;
+        tptrs.dstorage_calls = &g_core.dstorage_calls;
+        tptrs.dstorage_hits = &g_core.dstorage_hits;
+        tptrs.dstorage_buf_too_small = &g_core.dstorage_buf_too_small;
+        tptrs.file_open_calls = &g_core.file_open_calls;
+        tptrs.file_open_hits = &g_core.file_open_hits;
+        tptrs.input_events = &g_core.input_events;
+        tptrs.input_consumed = &g_core.input_consumed;
+        tptrs.frames_seen = &g_core.frames_seen;
+        fb_menu_ui_init(&g_core.menu_ui, &g_core.menu_lock, &g_core.settings, &g_core.bindings, &tptrs);
+    }
+
+    /* Load persisted user settings & bindings before plugins register */
+    {
+        int urc = fb_user_config_load(&g_core.settings, &g_core.bindings, NULL);
+        if (urc == FB_OK) {
+            char msg[256];
+            snprintf(
+                msg,
+                sizeof(msg),
+                "Loaded fireball_user_config.json (%zu setting overrides, %zu binding overrides)",
+                g_core.settings.override_count,
+                g_core.bindings.override_count);
+            core_log(FB_LOG_INFO, "fireball-core", msg);
+        }
+    }
+
+    /* Register Fireball Core's own Toggle Mod Menu action (F1 / LB + View) */
+    {
+        fb_action_desc_v1_t toggle_act;
+        memset(&toggle_act, 0, sizeof(toggle_act));
+        toggle_act.struct_size = (uint32_t)sizeof(toggle_act);
+        toggle_act.trigger_mode = (uint32_t)FB_TRIGGER_PRESS;
+        toggle_act.mod_id = "fireball.core";
+        toggle_act.action_id = "toggle_menu";
+        toggle_act.label = "Toggle Mod Menu";
+        toggle_act.description = "Open or close the Fireball in-game mod menu overlay";
+        toggle_act.consume_input = 1;
+        toggle_act.default_key.code = 0x70u; /* VK_F1 */
+        toggle_act.default_key.modifiers = FB_MOD_NONE;
+        toggle_act.default_pad.code = FB_PAD_BACK; /* View/Back */
+        toggle_act.default_pad.modifiers = FB_PAD_LEFT_SHOULDER; /* LB + View */
+        toggle_act.callback = fb_core_toggle_menu_action;
+        toggle_act.user_ctx = NULL;
+        fb_bindings_register(&g_core.bindings, &toggle_act);
+    }
 
     {
         char caps_str[512];
@@ -581,9 +740,23 @@ FB_API int fb_attach_host(
     services.title_mem_read_u32 = fb_svc_title_mem_read_u32;
     services.title_mem_write_u32 = fb_svc_title_mem_write_u32;
 
+    fb_menu_api_v1_t menu_api;
+    memset(&menu_api, 0, sizeof(menu_api));
+    menu_api.struct_size = (uint32_t)sizeof(menu_api);
+    menu_api.abi_version = FB_MENU_ABI_VERSION;
+    menu_api.register_mod = fb_menu_svc_register_mod;
+    menu_api.register_action = fb_menu_svc_register_action;
+    menu_api.register_setting = fb_menu_svc_register_setting;
+    menu_api.get_setting = fb_menu_svc_get_setting;
+    menu_api.set_setting = fb_menu_svc_set_setting;
+    menu_api.save_user_config = fb_menu_svc_save_user_config;
+    menu_api.is_menu_open = fb_menu_svc_is_menu_open;
+
     if (host_api->mods_root_dir && host_api->mods_root_dir[0] != L'\0') {
-        fb_plugin_mgr_discover_and_load(&g_core.plugin_mgr, host_api->mods_root_dir, &g_core.host_api, &services);
+        fb_plugin_mgr_discover_and_load(&g_core.plugin_mgr, host_api->mods_root_dir, &g_core.host_api, &services, &menu_api);
     }
+
+    fb_menu_ui_set_host_snapshot(&g_core.menu_ui, &g_core.host_api, &g_core.plugin_mgr);
 
     /* Populate host callbacks */
     memset(out_callbacks, 0, sizeof(*out_callbacks));

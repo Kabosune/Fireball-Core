@@ -23,6 +23,7 @@
 #include <windows.h>
 
 #include "fireball_plugin.h"
+#include "fireball_menu.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -67,6 +68,7 @@ typedef struct ss_state {
     FILE*    log;
     uint32_t snaps_requested;
     LARGE_INTEGER qpc_freq, qpc_start;
+    int      menu_registered;
 } ss_state_t;
 
 static ss_state_t g_ss;
@@ -345,6 +347,9 @@ static void ss_frame(const fb_frame_event_v1_t* fe) {
 }
 
 static int ss_input(const fb_input_event_v1_t* ev) {
+    if (g_ss.menu_registered) {
+        return 0; /* Handled centrally by Fireball-Core Action Binding Manager */
+    }
     if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t) || ev->device_kind != 0u ||
         ev->action != (uint32_t)FB_INPUT_PRESS) {
         return 0;
@@ -469,11 +474,162 @@ FB_API int fb_plugin_init(const fb_core_services_v1_t* core) {
     return FB_OK;
 }
 
+static void ss_menu_action(const char* action_id, int active, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_ss.initialized || !active || !action_id) {
+        return;
+    }
+    if (strcmp(action_id, "snap_run") == 0) {
+        ss_request_snapshot("run");
+    } else if (strcmp(action_id, "snap_paused") == 0) {
+        ss_request_snapshot("paused");
+    } else if (strcmp(action_id, "run_write_tests") == 0) {
+        if (g_ss.tier2) {
+            ss_run_write_tests();
+        } else {
+            ss_log(FB_LOG_WARN, "[state_scan] write test needs Tier 2 (FB_CAP_TITLE_MEM_RW + a symbol)");
+        }
+    }
+}
+
+static void ss_menu_setting_change(const char* setting_id, const fb_setting_value_t* val, void* user_ctx) {
+    (void)user_ctx;
+    if (setting_id && val && strcmp(setting_id, "verify_frames") == 0 && val->type == (uint32_t)FB_SETTING_INT) {
+        g_ss.verify_frames = (uint64_t)(val->v.int_val > 0 ? val->v.int_val : 1);
+    }
+}
+
+static void ss_menu_button(const char* setting_id, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_ss.initialized || !setting_id) {
+        return;
+    }
+    if (strcmp(setting_id, "snap_run_btn") == 0) {
+        ss_request_snapshot("run");
+    } else if (strcmp(setting_id, "snap_paused_btn") == 0) {
+        ss_request_snapshot("paused");
+    } else if (strcmp(setting_id, "write_test_btn") == 0) {
+        if (g_ss.tier2) {
+            ss_run_write_tests();
+        } else {
+            ss_log(FB_LOG_WARN, "[state_scan] write test needs Tier 2 (FB_CAP_TITLE_MEM_RW + a symbol)");
+        }
+    }
+}
+
+static void ss_menu_status(const char* setting_id, char* out_buf, size_t out_cap, void* user_ctx) {
+    (void)setting_id;
+    (void)user_ctx;
+    snprintf(
+        out_buf,
+        out_cap,
+        "snaps=%u  |  tier2=%s  |  watching=%u RVAs  |  frame=%llu",
+        g_ss.snaps_requested,
+        g_ss.tier2 ? "on" : "off",
+        g_ss.watch_count,
+        (unsigned long long)g_ss.frame);
+}
+
+FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
+    if (!menu || menu->abi_version != FB_MENU_ABI_VERSION || menu->struct_size < sizeof(fb_menu_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!menu->register_mod || !menu->register_action || !menu->register_setting) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    menu->register_mod(SS_MOD_ID, "State Scan", "Live title-memory snapshots, RVA watch, and write tests");
+
+    fb_setting_desc_v1_t s;
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = SS_MOD_ID;
+    s.type = (uint32_t)FB_SETTING_STATUS;
+    s.setting_id = "status";
+    s.label = "Scanner";
+    s.on_status = ss_menu_status;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = SS_MOD_ID;
+    s.section = "Scan Controls";
+    s.type = (uint32_t)FB_SETTING_INT;
+    s.setting_id = "verify_frames";
+    s.label = "Verify Delay (frames)";
+    s.description = "Frames to wait before secondary read-back verification";
+    s.default_int = (int32_t)g_ss.verify_frames;
+    s.int_min = 1;
+    s.int_max = 300;
+    s.int_step = 5;
+    s.on_change = ss_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = SS_MOD_ID;
+    s.section = "Scan Controls";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "snap_run_btn";
+    s.label = "Request Snapshot ('run')";
+    s.on_button = ss_menu_button;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = SS_MOD_ID;
+    s.section = "Scan Controls";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "snap_paused_btn";
+    s.label = "Request Snapshot ('paused')";
+    s.on_button = ss_menu_button;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = SS_MOD_ID;
+    s.section = "Scan Controls";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "write_test_btn";
+    s.label = "Run Write Tests";
+    s.on_button = ss_menu_button;
+    menu->register_setting(&s);
+
+    fb_action_desc_v1_t a;
+    memset(&a, 0, sizeof(a));
+    a.struct_size = (uint32_t)sizeof(a);
+    a.trigger_mode = (uint32_t)FB_TRIGGER_PRESS;
+    a.mod_id = SS_MOD_ID;
+    a.consume_input = 1;
+    a.callback = ss_menu_action;
+
+    a.action_id = "snap_run";
+    a.label = "Snapshot (run)";
+    a.description = "Request a VIctory title-memory snapshot labeled 'run'";
+    a.default_key.code = g_ss.key_snap_run;
+    menu->register_action(&a);
+
+    a.action_id = "snap_paused";
+    a.label = "Snapshot (paused)";
+    a.description = "Request a VIctory title-memory snapshot labeled 'paused'";
+    a.default_key.code = g_ss.key_snap_paused;
+    menu->register_action(&a);
+
+    a.action_id = "run_write_tests";
+    a.label = "Run Write Tests";
+    a.description = "Execute RVAs in write_tests_path and log read-backs";
+    a.default_key.code = g_ss.key_write_test;
+    menu->register_action(&a);
+
+    g_ss.menu_registered = 1;
+    return FB_OK;
+}
+
 FB_API void fb_plugin_shutdown(void) {
     if (!g_ss.initialized) {
         return;
     }
     g_ss.initialized = 0;
+    g_ss.menu_registered = 0;
     if (g_ss.log) {
         fclose(g_ss.log);
         g_ss.log = NULL;

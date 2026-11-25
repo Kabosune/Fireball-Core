@@ -31,6 +31,7 @@
 #include <windows.h>
 
 #include "fireball_plugin.h"
+#include "fireball_menu.h"
 #include "time_weather.h"
 
 #include <ctype.h>
@@ -75,6 +76,8 @@ typedef struct tw_cmds {
     double   set_tod;
     int      add_hours;
     int      toggle_pause;
+    int      has_pause;
+    int      pause_val;
     int      has_scale;
     double   scale;
     int      has_weather;
@@ -136,6 +139,11 @@ typedef struct tw_state {
     /* weather list (read-only after init) */
     tw_weather_entry_t weathers[TW_MAX_WEATHERS];
     uint32_t           weather_count;
+
+    /* menu integration */
+    int                menu_registered;
+    fb_menu_api_v1_t   menu;
+    int32_t            menu_weather_sel;
 } tw_state_t;
 
 static tw_state_t g_tw;
@@ -477,6 +485,15 @@ void tw_cmd_add_hours(int hours) {
 void tw_cmd_toggle_pause(void) {
     AcquireSRWLockExclusive(&g_tw.lock);
     g_tw.cmds.toggle_pause ^= 1;
+    g_tw.cmds.has_pause = 0;
+    ReleaseSRWLockExclusive(&g_tw.lock);
+}
+
+static void tw_cmd_set_pause(int paused) {
+    AcquireSRWLockExclusive(&g_tw.lock);
+    g_tw.cmds.has_pause = 1;
+    g_tw.cmds.pause_val = paused ? 1 : 0;
+    g_tw.cmds.toggle_pause = 0;
     ReleaseSRWLockExclusive(&g_tw.lock);
 }
 
@@ -562,6 +579,16 @@ static void tw_frame(const fb_frame_event_v1_t* fe) {
                 g_tw.owned_tod = tod;
             }
             g_tw.scale = c.scale;
+        }
+        if (c.has_pause) {
+            int next_p = c.pause_val ? 1 : 0;
+            if (next_p != g_tw.paused) {
+                g_tw.paused = next_p;
+                if (g_tw.paused && !owning && have_tod) {
+                    g_tw.owned_tod = tod;
+                }
+                tw_log(FB_LOG_INFO, g_tw.paused ? "[time_weather] clock paused" : "[time_weather] clock resumed");
+            }
         }
         if (c.toggle_pause) {
             g_tw.paused = !g_tw.paused;
@@ -669,6 +696,9 @@ static int32_t tw_weather_step(int dir) {
 }
 
 static int tw_input(const fb_input_event_v1_t* ev) {
+    if (g_tw.menu_registered) {
+        return 0; /* Handled centrally by Fireball-Core Action Binding Manager */
+    }
     if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t) || ev->device_kind != TW_DEV_KEYBOARD ||
         ev->action != (uint32_t)FB_INPUT_PRESS) {
         return 0;
@@ -885,11 +915,379 @@ FB_API int fb_plugin_init(const fb_core_services_v1_t* core) {
     return FB_OK;
 }
 
+static const char* const k_tw_scale_labels[] = {
+    "1x (game rate)", "0.25x", "0.5x", "2x", "5x", "10x", "30x", "60x", "Real time"
+};
+static const double k_tw_scale_vals[] = {
+    1.0, 0.25, 0.5, 2.0, 5.0, 10.0, 30.0, 60.0, -1.0
+};
+
+static void tw_menu_action(const char* action_id, int active, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_tw.initialized || !active || !action_id) {
+        return;
+    }
+    if (strcmp(action_id, "hour_up") == 0) {
+        if (g_tw.clock_ok) {
+            tw_cmd_add_hours(1);
+        }
+    } else if (strcmp(action_id, "hour_down") == 0) {
+        if (g_tw.clock_ok) {
+            tw_cmd_add_hours(-1);
+        }
+    } else if (strcmp(action_id, "toggle_pause") == 0) {
+        if (g_tw.clock_ok) {
+            tw_cmd_toggle_pause();
+        }
+    } else if (strcmp(action_id, "weather_prev") == 0 || strcmp(action_id, "weather_next") == 0) {
+        if (g_tw.weather_ok) {
+            int dir = (strcmp(action_id, "weather_next") == 0) ? 1 : -1;
+            int32_t idx = tw_weather_step(dir);
+            if (idx >= 0) {
+                g_tw.menu_weather_sel = idx;
+                tw_cmd_set_weather(idx, 0);
+                char msg[160];
+                const tw_weather_entry_t* e = tw_weather_at((uint32_t)idx);
+                snprintf(msg, sizeof(msg), "[time_weather] weather -> #%d %s", idx, e ? e->name : "");
+                tw_log(FB_LOG_INFO, msg);
+            }
+        }
+    } else if (strcmp(action_id, "toggle_window") == 0) {
+        if (g_tw.ui_enabled) {
+            tw_ui_toggle();
+        }
+    }
+}
+
+static void tw_menu_setting_change(const char* setting_id, const fb_setting_value_t* val, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_tw.initialized || !setting_id || !val) {
+        return;
+    }
+    if (strcmp(setting_id, "time_of_day_min") == 0 && val->type == (uint32_t)FB_SETTING_INT) {
+        if (g_tw.clock_ok) {
+            tw_cmd_set_tod((double)val->v.int_val * 60.0);
+        }
+    } else if (strcmp(setting_id, "clock_paused") == 0 && val->type == (uint32_t)FB_SETTING_BOOL) {
+        if (g_tw.clock_ok) {
+            tw_cmd_set_pause(val->v.bool_val);
+        }
+    } else if (strcmp(setting_id, "time_scale") == 0 && val->type == (uint32_t)FB_SETTING_ENUM) {
+        int32_t idx = val->v.enum_val;
+        if (g_tw.clock_ok && idx >= 0 && (size_t)idx < sizeof(k_tw_scale_vals) / sizeof(k_tw_scale_vals[0])) {
+            double s = k_tw_scale_vals[idx];
+            if (s < 0.0) {
+                s = tw_ms_per_game_minute() / 60000.0;
+            }
+            tw_cmd_set_scale(s);
+        }
+    } else if (strcmp(setting_id, "weather_preset") == 0 && val->type == (uint32_t)FB_SETTING_ENUM) {
+        g_tw.menu_weather_sel = val->v.enum_val;
+    } else if (strcmp(setting_id, "weather_blend_ms") == 0 && val->type == (uint32_t)FB_SETTING_FLOAT) {
+        g_tw.weather_blend_ms = val->v.float_val;
+    } else if (strcmp(setting_id, "weather_locked") == 0 && val->type == (uint32_t)FB_SETTING_BOOL) {
+        if (g_tw.weather_ok) {
+            tw_cmd_set_lock(val->v.bool_val);
+        }
+    }
+}
+
+static void tw_menu_button(const char* setting_id, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_tw.initialized || !setting_id) {
+        return;
+    }
+    if (strcmp(setting_id, "hour_down_btn") == 0 && g_tw.clock_ok) {
+        tw_cmd_add_hours(-1);
+    } else if (strcmp(setting_id, "hour_up_btn") == 0 && g_tw.clock_ok) {
+        tw_cmd_add_hours(1);
+    } else if (strcmp(setting_id, "weather_set_btn") == 0 && g_tw.weather_ok) {
+        tw_cmd_set_weather(g_tw.menu_weather_sel, 0);
+    } else if (strcmp(setting_id, "weather_blend_btn") == 0 && g_tw.weather_ok) {
+        tw_cmd_set_weather(g_tw.menu_weather_sel, 1);
+    }
+}
+
+static void tw_menu_status(const char* setting_id, char* out_buf, size_t out_cap, void* user_ctx) {
+    (void)user_ctx;
+    tw_status_t st;
+    tw_get_status(&st);
+    if (setting_id && strcmp(setting_id, "clock_status") == 0) {
+        if (st.clock_ok) {
+            unsigned t = (unsigned)st.tod_sec;
+            snprintf(out_buf, out_cap, "%02u:%02u:%02u %s scale %.2fx (writes %llu)",
+                     t / 3600u, (t % 3600u) / 60u, t % 60u,
+                     st.paused ? "[paused]" : "", st.scale, (unsigned long long)st.writes);
+        } else {
+            snprintf(out_buf, out_cap, "unavailable (symbol unset)");
+        }
+    } else if (setting_id && strcmp(setting_id, "weather_status") == 0) {
+        if (st.weather_ok) {
+            const tw_weather_entry_t* cur = st.weather_cur >= 0 ? tw_weather_at((uint32_t)st.weather_cur) : NULL;
+            const tw_weather_entry_t* tgt = st.weather_target >= 0 ? tw_weather_at((uint32_t)st.weather_target) : NULL;
+            snprintf(out_buf, out_cap, "now: %s | held: %s%s%s",
+                     cur ? cur->name : "?", tgt ? tgt->name : "-",
+                     st.weather_locked ? " [locked]" : "",
+                     st.blend_progress < 1.0 ? " [blending]" : "");
+        } else {
+            snprintf(out_buf, out_cap, "unavailable");
+        }
+    }
+}
+
+FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
+    if (!menu || menu->abi_version != FB_MENU_ABI_VERSION || menu->struct_size < sizeof(fb_menu_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!menu->register_mod || !menu->register_action || !menu->register_setting) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    g_tw.menu = *menu;
+    menu->register_mod(TW_MOD_ID, "Time & Weather", "Single-player clock and weather controls");
+
+    fb_setting_desc_v1_t s;
+
+    /* Live Status */
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.type = (uint32_t)FB_SETTING_STATUS;
+    s.setting_id = "clock_status";
+    s.label = "Clock";
+    s.on_status = tw_menu_status;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.type = (uint32_t)FB_SETTING_STATUS;
+    s.setting_id = "weather_status";
+    s.label = "Weather";
+    s.on_status = tw_menu_status;
+    menu->register_setting(&s);
+
+    /* Clock Settings */
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Clock";
+    s.type = (uint32_t)FB_SETTING_INT;
+    s.setting_id = "time_of_day_min";
+    s.label = "Time of Day (minutes)";
+    s.description = "Set clock directly in minutes from midnight (0..1439)";
+    s.default_int = 720;
+    s.int_min = 0;
+    s.int_max = 1439;
+    s.int_step = 15;
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Clock";
+    s.type = (uint32_t)FB_SETTING_BOOL;
+    s.setting_id = "clock_paused";
+    s.label = "Pause Clock";
+    s.description = "Freeze the in-game clock at the current time";
+    s.default_bool = 0;
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Clock";
+    s.type = (uint32_t)FB_SETTING_ENUM;
+    s.setting_id = "time_scale";
+    s.label = "Time Scale";
+    s.description = "Speed up, slow down, or run the game clock in real time";
+    s.default_enum = 0;
+    s.enum_labels = k_tw_scale_labels;
+    s.enum_count = (uint32_t)(sizeof(k_tw_scale_labels) / sizeof(k_tw_scale_labels[0]));
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Clock";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "hour_down_btn";
+    s.label = "Step Clock -1 Hour";
+    s.description = "Rewind game clock by one hour";
+    s.on_button = tw_menu_button;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Clock";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "hour_up_btn";
+    s.label = "Step Clock +1 Hour";
+    s.description = "Advance game clock by one hour";
+    s.on_button = tw_menu_button;
+    menu->register_setting(&s);
+
+    /* Weather Settings */
+    const char* weather_ptrs[TW_MAX_WEATHERS];
+    char fallback_names[168][12];
+    uint32_t wcount = g_tw.weather_count;
+    if (wcount > 0u) {
+        if (wcount > TW_MAX_WEATHERS) {
+            wcount = TW_MAX_WEATHERS;
+        }
+        for (uint32_t i = 0; i < wcount; ++i) {
+            weather_ptrs[i] = g_tw.weathers[i].name;
+        }
+    } else {
+        wcount = 168u;
+        for (uint32_t i = 0; i < wcount; ++i) {
+            snprintf(fallback_names[i], sizeof(fallback_names[i]), "#%u", i);
+            weather_ptrs[i] = fallback_names[i];
+        }
+    }
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Weather";
+    s.type = (uint32_t)FB_SETTING_ENUM;
+    s.setting_id = "weather_preset";
+    s.label = "Target Weather";
+    s.description = "Select weather type to apply or blend into";
+    s.default_enum = 0;
+    s.enum_labels = weather_ptrs;
+    s.enum_count = wcount;
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Weather";
+    s.type = (uint32_t)FB_SETTING_FLOAT;
+    s.setting_id = "weather_blend_ms";
+    s.label = "Blend Duration";
+    s.description = "Transition time in milliseconds when blending weather";
+    s.default_float = g_tw.weather_blend_ms;
+    s.float_min = 0.0;
+    s.float_max = 60000.0;
+    s.float_step = 1000.0;
+    s.float_fmt = "%.0f ms";
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Weather";
+    s.type = (uint32_t)FB_SETTING_BOOL;
+    s.setting_id = "weather_locked";
+    s.label = "Lock Weather";
+    s.description = "Re-assert held weather every frame against the game cycle";
+    s.default_bool = g_tw.weather_locked;
+    s.on_change = tw_menu_setting_change;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Weather";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "weather_set_btn";
+    s.label = "Apply Weather Now";
+    s.description = "Immediately switch to the selected Target Weather";
+    s.on_button = tw_menu_button;
+    menu->register_setting(&s);
+
+    memset(&s, 0, sizeof(s));
+    s.struct_size = (uint32_t)sizeof(s);
+    s.mod_id = TW_MOD_ID;
+    s.section = "Weather";
+    s.type = (uint32_t)FB_SETTING_BUTTON;
+    s.setting_id = "weather_blend_btn";
+    s.label = "Blend to Weather";
+    s.description = "Smoothly transition to Target Weather over Blend Duration";
+    s.on_button = tw_menu_button;
+    menu->register_setting(&s);
+
+    /* Actions */
+    fb_action_desc_v1_t a;
+    memset(&a, 0, sizeof(a));
+    a.struct_size = (uint32_t)sizeof(a);
+    a.trigger_mode = (uint32_t)FB_TRIGGER_PRESS;
+    a.mod_id = TW_MOD_ID;
+    a.consume_input = 1;
+    a.callback = tw_menu_action;
+
+    a.action_id = "hour_up";
+    a.label = "Clock +1 Hour";
+    a.description = "Advance game clock by 1 hour";
+    a.default_key.code = g_tw.key_hour_up;
+    a.default_key.modifiers = FB_MOD_NONE;
+    a.default_pad.code = FB_PAD_DPAD_UP;
+    a.default_pad.modifiers = FB_PAD_LEFT_SHOULDER;
+    menu->register_action(&a);
+
+    a.action_id = "hour_down";
+    a.label = "Clock -1 Hour";
+    a.description = "Rewind game clock by 1 hour";
+    a.default_key.code = g_tw.key_hour_down;
+    a.default_key.modifiers = FB_MOD_NONE;
+    a.default_pad.code = FB_PAD_DPAD_DOWN;
+    a.default_pad.modifiers = FB_PAD_LEFT_SHOULDER;
+    menu->register_action(&a);
+
+    a.action_id = "toggle_pause";
+    a.label = "Pause / Resume Clock";
+    a.description = "Toggle freezing the game clock";
+    a.default_key.code = g_tw.key_pause;
+    a.default_key.modifiers = FB_MOD_NONE;
+    a.default_pad.code = FB_PAD_START;
+    a.default_pad.modifiers = FB_PAD_LEFT_SHOULDER;
+    menu->register_action(&a);
+
+    a.action_id = "weather_prev";
+    a.label = "Previous Weather";
+    a.description = "Switch to the previous weather preset";
+    a.default_key.code = g_tw.key_weather_prev;
+    a.default_key.modifiers = FB_MOD_NONE;
+    a.default_pad.code = FB_PAD_DPAD_LEFT;
+    a.default_pad.modifiers = FB_PAD_LEFT_SHOULDER;
+    menu->register_action(&a);
+
+    a.action_id = "weather_next";
+    a.label = "Next Weather";
+    a.description = "Switch to the next weather preset";
+    a.default_key.code = g_tw.key_weather_next;
+    a.default_key.modifiers = FB_MOD_NONE;
+    a.default_pad.code = FB_PAD_DPAD_RIGHT;
+    a.default_pad.modifiers = FB_PAD_LEFT_SHOULDER;
+    menu->register_action(&a);
+
+    if (g_tw.ui_enabled) {
+        a.action_id = "toggle_window";
+        a.label = "Legacy F8 Window";
+        a.description = "Open standalone Win32 Time & Weather tool window";
+        a.default_key.code = g_tw.key_window;
+        a.default_key.modifiers = FB_MOD_NONE;
+        a.default_pad.code = FB_PAD_NONE;
+        a.default_pad.modifiers = FB_PAD_NONE;
+        menu->register_action(&a);
+    }
+
+    g_tw.menu_registered = 1;
+    return FB_OK;
+}
+
 FB_API void fb_plugin_shutdown(void) {
     if (!g_tw.initialized) {
         return;
     }
     g_tw.initialized = 0;
+    g_tw.menu_registered = 0;
     tw_ui_shutdown();
     /* Holds end here: the game's own clock and weather take over from the last written state. */
     g_tw.paused = 0;

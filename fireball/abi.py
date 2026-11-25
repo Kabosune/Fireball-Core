@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 
 FB_HOST_ABI_VERSION = 1
 FB_PLUGIN_ABI_VERSION = 1
+FB_MENU_ABI_VERSION = 1
 
 # Status codes (fb_status_t)
 FB_OK = 0
@@ -84,6 +85,40 @@ FB_INPUT_REPEAT = 2
 FB_DEV_KEYBOARD = 0
 FB_DEV_GAMEPAD = 1
 
+# Keyboard modifier masks
+FB_MOD_NONE = 0
+FB_MOD_SHIFT = 1 << 0
+FB_MOD_CTRL = 1 << 1
+FB_MOD_ALT = 1 << 2
+
+# XInput gamepad masks (mirrors fireball_menu.h)
+FB_PAD_NONE = 0x0000
+FB_PAD_DPAD_UP = 0x0001
+FB_PAD_DPAD_DOWN = 0x0002
+FB_PAD_DPAD_LEFT = 0x0004
+FB_PAD_DPAD_RIGHT = 0x0008
+FB_PAD_START = 0x0010
+FB_PAD_BACK = 0x0020
+FB_PAD_LEFT_THUMB = 0x0040
+FB_PAD_RIGHT_THUMB = 0x0080
+FB_PAD_LEFT_SHOULDER = 0x0100
+FB_PAD_RIGHT_SHOULDER = 0x0200
+FB_PAD_A = 0x1000
+FB_PAD_B = 0x2000
+FB_PAD_X = 0x4000
+FB_PAD_Y = 0x8000
+
+# Action trigger modes & setting types (mirrors fireball_menu.h)
+FB_TRIGGER_PRESS = 0
+FB_TRIGGER_HOLD = 1
+
+FB_SETTING_BOOL = 1
+FB_SETTING_INT = 2
+FB_SETTING_FLOAT = 3
+FB_SETTING_ENUM = 4
+FB_SETTING_BUTTON = 5
+FB_SETTING_STATUS = 6
+
 
 @dataclass(frozen=True)
 class InputEvent:
@@ -119,11 +154,12 @@ def missing_cap_names(required_mask: int, active_mask: int) -> List[str]:
 
 
 def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
-    """Static verification of include/fireball_host.h and include/fireball_plugin.h."""
+    """Static verification of include/fireball_host.h, include/fireball_plugin.h, and include/fireball_menu.h."""
     errors: List[str] = []
     host_h = os.path.join(include_dir, "fireball_host.h")
     plugin_h = os.path.join(include_dir, "fireball_plugin.h")
-    for p in (host_h, plugin_h):
+    menu_h = os.path.join(include_dir, "fireball_menu.h")
+    for p in (host_h, plugin_h, menu_h):
         if not os.path.isfile(p):
             errors.append(f"Missing header: {p}")
     if errors:
@@ -133,9 +169,11 @@ def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
         host_txt = f.read()
     with open(plugin_h, "r", encoding="utf-8") as f:
         plugin_txt = f.read()
+    with open(menu_h, "r", encoding="utf-8") as f:
+        menu_txt = f.read()
 
     # Check pure-C11 compatibility (no C23 fixed-underlying enum syntax)
-    for label, txt in (("fireball_host.h", host_txt), ("fireball_plugin.h", plugin_txt)):
+    for label, txt in (("fireball_host.h", host_txt), ("fireball_plugin.h", plugin_txt), ("fireball_menu.h", menu_txt)):
         if re.search(r"enum\s+\w+\s*:\s*uint\d+_t", txt):
             errors.append(f"{label}: uses C23 fixed-underlying enum syntax (not strict C11)")
         if 'extern "C"' not in txt:
@@ -185,5 +223,25 @@ def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
     ):
         if sym not in plugin_txt:
             errors.append(f"fireball_plugin.h: missing required symbol '{sym}'")
+
+    # Verify required structs & function pointers in menu header
+    for sym in (
+        "FB_MENU_ABI_VERSION",
+        "fb_binding_chord_t",
+        "fb_action_desc_v1_t",
+        "fb_setting_value_t",
+        "fb_setting_desc_v1_t",
+        "fb_menu_api_v1_t",
+        "register_mod",
+        "register_action",
+        "register_setting",
+        "get_setting",
+        "set_setting",
+        "save_user_config",
+        "is_menu_open",
+        "fb_plugin_register_menu",
+    ):
+        if sym not in menu_txt:
+            errors.append(f"fireball_menu.h: missing required symbol '{sym}'")
 
     return (len(errors) == 0), errors

@@ -39,6 +39,9 @@ fb_apply_strict_warnings(fireball_abi_check_cpp)
 add_library(fireball_core SHARED
     src/core/fb_bundle.c
     src/core/fb_plugins.c
+    src/core/fb_bindings.c
+    src/core/fb_settings.c
+    src/core/fb_menu_ui.c
     src/core/fb_core.c
 )
 target_compile_definitions(fireball_core PRIVATE FB_BUILD_DLL)
@@ -46,6 +49,9 @@ target_include_directories(fireball_core
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core
 )
+if(WIN32)
+    target_link_libraries(fireball_core PRIVATE user32 gdi32)
+endif()
 set_target_properties(fireball_core PROPERTIES
     OUTPUT_NAME "fireball_core"
     PREFIX ""
@@ -119,6 +125,43 @@ add_dependencies(fireball_mock_host
 fb_apply_strict_warnings(fireball_mock_host)
 
 # ---------------------------------------------------------------------------
+# 4b. Mod Menu, Settings & Action Binding Unit + End-to-End Integration Tests
+# ---------------------------------------------------------------------------
+add_library(v1_compat_plugin SHARED
+    tests/native/v1_compat_plugin.c
+)
+target_compile_definitions(v1_compat_plugin PRIVATE FB_BUILD_DLL)
+target_include_directories(v1_compat_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(v1_compat_plugin PROPERTIES
+    OUTPUT_NAME "v1_compat.fbplugin"
+    PREFIX ""
+)
+fb_apply_strict_warnings(v1_compat_plugin)
+
+add_executable(fireball_menu_test
+    tests/native/menu_system_test.c
+    src/core/fb_bindings.c
+    src/core/fb_settings.c
+    src/core/fb_menu_ui.c
+    src/core/fb_plugins.c
+)
+target_include_directories(fireball_menu_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+if(WIN32)
+    target_link_libraries(fireball_menu_test PRIVATE user32 gdi32)
+endif()
+add_dependencies(fireball_menu_test
+    fireball_core
+    fpv_toggle_plugin
+    time_weather_plugin
+    state_scan_plugin
+    v1_compat_plugin
+)
+fb_apply_strict_warnings(fireball_menu_test)
+
+# ---------------------------------------------------------------------------
 # 5. CTest integration
 # ---------------------------------------------------------------------------
 include(CTest)
@@ -134,5 +177,14 @@ if(BUILD_TESTING)
         COMMAND $<TARGET_FILE:fireball_plugin_examples_test>
             --time-weather $<TARGET_FILE:time_weather_plugin>
             --state-scan $<TARGET_FILE:state_scan_plugin>
+    )
+    add_test(
+        NAME fireball_menu_system_native
+        COMMAND $<TARGET_FILE:fireball_menu_test>
+            --core $<TARGET_FILE:fireball_core>
+            --fpv $<TARGET_FILE:fpv_toggle_plugin>
+            --time-weather $<TARGET_FILE:time_weather_plugin>
+            --state-scan $<TARGET_FILE:state_scan_plugin>
+            --v1-compat $<TARGET_FILE:v1_compat_plugin>
     )
 endif()

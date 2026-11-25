@@ -74,6 +74,35 @@ static void fb_host_log(const fb_host_api_v1_t* host_api, int level, const char*
     }
 }
 
+static void fb_record_skipped(
+    fb_plugin_manager_t* mgr,
+    const char*          plugin_id,
+    const char*          mod_id,
+    const char*          version,
+    const char*          reason)
+{
+    if (!mgr) {
+        return;
+    }
+    if (mgr->skipped_count == mgr->skipped_cap) {
+        size_t new_cap = (mgr->skipped_cap == 0) ? 8u : (mgr->skipped_cap * 2u);
+        fb_skipped_plugin_t* grown = (fb_skipped_plugin_t*)realloc(
+            mgr->skipped,
+            new_cap * sizeof(fb_skipped_plugin_t));
+        if (!grown) {
+            return;
+        }
+        mgr->skipped = grown;
+        mgr->skipped_cap = new_cap;
+    }
+    fb_skipped_plugin_t* s = &mgr->skipped[mgr->skipped_count++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->plugin_id, sizeof(s->plugin_id), "%s", plugin_id ? plugin_id : "<unknown>");
+    snprintf(s->mod_id, sizeof(s->mod_id), "%s", mod_id ? mod_id : "<unknown>");
+    snprintf(s->version, sizeof(s->version), "%s", version ? version : "0.0.0");
+    snprintf(s->reason, sizeof(s->reason), "%s", reason ? reason : "skipped");
+}
+
 typedef struct fb_wpath_list {
     wchar_t** items;
     size_t    count;
@@ -198,11 +227,22 @@ int fb_plugin_mgr_add_listener(fb_plugin_manager_t* mgr, uint32_t event_id, fb_e
     return FB_OK;
 }
 
+static const char* fb_basename_utf8(const char* path) {
+    if (!path) {
+        return "<plugin>";
+    }
+    const char* s1 = strrchr(path, '\\');
+    const char* s2 = strrchr(path, '/');
+    const char* p = s1 > s2 ? s1 : s2;
+    return p ? (p + 1) : path;
+}
+
 void fb_plugin_mgr_discover_and_load(
     fb_plugin_manager_t*         mgr,
     const wchar_t*               mods_root_dir,
     const fb_host_api_v1_t*      host_api,
-    const fb_core_services_v1_t* services)
+    const fb_core_services_v1_t* services,
+    const fb_menu_api_v1_t*      menu_api)
 {
     if (!mgr || !mods_root_dir || !host_api || !services) {
         return;
@@ -222,12 +262,17 @@ void fb_plugin_mgr_discover_and_load(
         if (pn <= 0) {
             snprintf(utf8_path, sizeof(utf8_path), "<plugin#%zu>", i);
         }
+        const char* dll_name = fb_basename_utf8(utf8_path);
 
         HMODULE mod = LoadLibraryW(dll_path);
         if (!mod) {
+            DWORD err = GetLastError();
             char msg[768];
-            snprintf(msg, sizeof(msg), "Failed to LoadLibraryW('%s'): Win32 error %lu", utf8_path, (unsigned long)GetLastError());
+            snprintf(msg, sizeof(msg), "Failed to LoadLibraryW('%s'): Win32 error %lu", utf8_path, (unsigned long)err);
             fb_host_log(host_api, FB_LOG_WARN, msg);
+            char reason[128];
+            snprintf(reason, sizeof(reason), "LoadLibraryW failed (Win32 error %lu)", (unsigned long)err);
+            fb_record_skipped(mgr, dll_name, "-", "-", reason);
             continue;
         }
 
@@ -238,6 +283,7 @@ void fb_plugin_mgr_discover_and_load(
             char msg[768];
             snprintf(msg, sizeof(msg), "Skipping '%s': missing required fb_plugin_* exports", utf8_path);
             fb_host_log(host_api, FB_LOG_WARN, msg);
+            fb_record_skipped(mgr, dll_name, "-", "-", "missing required fb_plugin_* exports");
             FreeLibrary(mod);
             continue;
         }
@@ -257,6 +303,9 @@ void fb_plugin_mgr_discover_and_load(
                 info.abi_version,
                 info.struct_size);
             fb_host_log(host_api, FB_LOG_WARN, msg);
+            char reason[160];
+            snprintf(reason, sizeof(reason), "ABI mismatch / query error (rc=%d, abi=%u)", qrc, info.abi_version);
+            fb_record_skipped(mgr, dll_name, "-", "-", reason);
             FreeLibrary(mod);
             continue;
         }
@@ -281,6 +330,9 @@ void fb_plugin_mgr_discover_and_load(
                 host_api->host_name ? host_api->host_name : "unknown",
                 missing_str);
             fb_host_log(host_api, FB_LOG_WARN, msg);
+            char reason[256];
+            snprintf(reason, sizeof(reason), "missing caps: %s", missing_str);
+            fb_record_skipped(mgr, plugin_id, mod_id, version, reason);
             FreeLibrary(mod);
             continue;
         }
@@ -309,8 +361,31 @@ void fb_plugin_mgr_discover_and_load(
             char msg[768];
             snprintf(msg, sizeof(msg), "Plugin '%s' (mod '%s') fb_plugin_init returned error %d; unloading", plugin_id, mod_id, irc);
             fb_host_log(host_api, FB_LOG_WARN, msg);
+            char reason[160];
+            if (irc == FB_ERR_NOT_FOUND) {
+                snprintf(reason, sizeof(reason), "standby: required engine symbol not resolved (FB_ERR_NOT_FOUND)");
+            } else {
+                snprintf(reason, sizeof(reason), "fb_plugin_init returned %d", irc);
+            }
+            fb_record_skipped(mgr, plugin_id, mod_id, version, reason);
             FreeLibrary(mod);
             continue;
+        }
+
+        int has_menu_api = 0;
+        if (menu_api) {
+            fb_plugin_register_menu_fn reg_menu_fn =
+                (fb_plugin_register_menu_fn)GetProcAddress(mod, "fb_plugin_register_menu");
+            if (reg_menu_fn) {
+                int mrc = reg_menu_fn(menu_api);
+                if (mrc == FB_OK) {
+                    has_menu_api = 1;
+                } else {
+                    char msg[512];
+                    snprintf(msg, sizeof(msg), "Plugin '%s' fb_plugin_register_menu returned %d (continuing without menu)", plugin_id, mrc);
+                    fb_host_log(host_api, FB_LOG_WARN, msg);
+                }
+            }
         }
 
         fb_loaded_plugin_t* slot = &mgr->plugins[mgr->plugin_count++];
@@ -321,9 +396,17 @@ void fb_plugin_mgr_discover_and_load(
         snprintf(slot->plugin_id, sizeof(slot->plugin_id), "%s", plugin_id);
         snprintf(slot->version, sizeof(slot->version), "%s", version);
         slot->required_caps = info.required_caps;
+        slot->has_menu_api = has_menu_api;
 
         char msg[512];
-        snprintf(msg, sizeof(msg), "Loaded native plugin '%s' (mod '%s' v%s)", slot->plugin_id, slot->mod_id, slot->version);
+        snprintf(
+            msg,
+            sizeof(msg),
+            "Loaded native plugin '%s' (mod '%s' v%s%s)",
+            slot->plugin_id,
+            slot->mod_id,
+            slot->version,
+            has_menu_api ? ", menu-enabled" : ", v1-compat");
         fb_host_log(host_api, FB_LOG_INFO, msg);
     }
 
@@ -371,6 +454,7 @@ void fb_plugin_mgr_shutdown_all(fb_plugin_manager_t* mgr, const fb_host_api_v1_t
     }
 
     free(mgr->plugins);
+    free(mgr->skipped);
     free(mgr->listeners);
     memset(mgr, 0, sizeof(*mgr));
     mgr->loading_plugin_index = -1;

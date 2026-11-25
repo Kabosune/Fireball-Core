@@ -14,6 +14,7 @@
  */
 
 #include "fireball_plugin.h"
+#include "fireball_menu.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -41,6 +42,8 @@ typedef struct fpv_state {
     uint64_t              toggle_count;
     uint64_t              reassert_count;
     uint64_t              frames_seen;
+    int                   menu_registered;
+    fb_menu_api_v1_t      menu;
 } fpv_state_t;
 
 static fpv_state_t g_fpv;
@@ -126,17 +129,7 @@ static int fpv_json_read_str(const char* json, const char* key, char* out_buf, s
     return 1;
 }
 
-static int fpv_handle_input(const fb_input_event_v1_t* ev) {
-    if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t)) {
-        return 0;
-    }
-    if (ev->device_kind != FPV_DEV_KEYBOARD) {
-        return 0;
-    }
-    if (ev->code != g_fpv.hotkey_vkey || ev->action != (uint32_t)FB_INPUT_PRESS) {
-        return 0;
-    }
-
+static int fpv_perform_toggle(void) {
     uint32_t cur_mode = 0;
     int rc = g_fpv.core.title_mem_read_u32(g_fpv.view_mode_va, &cur_mode);
     if (rc != FB_OK) {
@@ -182,6 +175,61 @@ static int fpv_handle_input(const fb_input_event_v1_t* ev) {
         fpv_log(FB_LOG_INFO, msg);
     }
     return 1;
+}
+
+static int fpv_handle_input(const fb_input_event_v1_t* ev) {
+    if (g_fpv.menu_registered) {
+        return 0; /* Handled centrally by Fireball-Core Action Binding Manager */
+    }
+    if (!ev || ev->struct_size < sizeof(fb_input_event_v1_t)) {
+        return 0;
+    }
+    if (ev->device_kind != FPV_DEV_KEYBOARD) {
+        return 0;
+    }
+    if (ev->code != g_fpv.hotkey_vkey || ev->action != (uint32_t)FB_INPUT_PRESS) {
+        return 0;
+    }
+    return fpv_perform_toggle();
+}
+
+static void fpv_on_action(const char* action_id, int active, void* user_ctx) {
+    (void)user_ctx;
+    if (!g_fpv.initialized || !active) {
+        return;
+    }
+    if (action_id && strcmp(action_id, "toggle_fpv") == 0) {
+        (void)fpv_perform_toggle();
+    }
+}
+
+static void fpv_on_setting_change(const char* setting_id, const fb_setting_value_t* val, void* user_ctx) {
+    (void)user_ctx;
+    if (!setting_id || !val) {
+        return;
+    }
+    if (strcmp(setting_id, "hold_guard_enabled") == 0 && val->type == (uint32_t)FB_SETTING_BOOL) {
+        g_fpv.hold_guard_enabled = val->v.bool_val ? 1 : 0;
+    }
+}
+
+static void fpv_on_button(const char* setting_id, void* user_ctx) {
+    (void)user_ctx;
+    if (g_fpv.initialized && setting_id && strcmp(setting_id, "toggle_now") == 0) {
+        (void)fpv_perform_toggle();
+    }
+}
+
+static void fpv_on_status(const char* setting_id, char* out_buf, size_t out_cap, void* user_ctx) {
+    (void)setting_id;
+    (void)user_ctx;
+    snprintf(
+        out_buf,
+        out_cap,
+        "%s  |  toggles=%llu  re-asserts=%llu",
+        g_fpv.fpv_latched ? "FirstPerson (latched)" : "ThirdPerson",
+        (unsigned long long)g_fpv.toggle_count,
+        (unsigned long long)g_fpv.reassert_count);
 }
 
 static void fpv_handle_frame_begin(const fb_frame_event_v1_t* frame) {
@@ -327,11 +375,76 @@ FB_API int fb_plugin_init(const fb_core_services_v1_t* core) {
     return FB_OK;
 }
 
+FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
+    if (!menu || menu->abi_version != FB_MENU_ABI_VERSION || menu->struct_size < sizeof(fb_menu_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!menu->register_mod || !menu->register_action || !menu->register_setting) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    g_fpv.menu = *menu;
+    menu->register_mod(FPV_MOD_ID, "FPV Unlocker", "On-foot First-Person View toggle and hold-guard");
+
+    fb_setting_desc_v1_t st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = (uint32_t)sizeof(st);
+    st.mod_id = FPV_MOD_ID;
+    st.type = (uint32_t)FB_SETTING_STATUS;
+    st.setting_id = "status";
+    st.label = "FPV Camera";
+    st.description = "Current camera view mode latch state and re-assert counter";
+    st.on_status = fpv_on_status;
+    menu->register_setting(&st);
+
+    memset(&st, 0, sizeof(st));
+    st.struct_size = (uint32_t)sizeof(st);
+    st.mod_id = FPV_MOD_ID;
+    st.section = "Camera";
+    st.type = (uint32_t)FB_SETTING_BOOL;
+    st.setting_id = "hold_guard_enabled";
+    st.label = "Hold-Guard Context Resets";
+    st.description = "Re-assert FirstPerson view mode if the game resets it while latched ON";
+    st.default_bool = g_fpv.hold_guard_enabled;
+    st.on_change = fpv_on_setting_change;
+    menu->register_setting(&st);
+
+    memset(&st, 0, sizeof(st));
+    st.struct_size = (uint32_t)sizeof(st);
+    st.mod_id = FPV_MOD_ID;
+    st.section = "Camera";
+    st.type = (uint32_t)FB_SETTING_BUTTON;
+    st.setting_id = "toggle_now";
+    st.label = "Toggle First-Person Now";
+    st.description = "Immediately flip between ThirdPerson and FirstPerson";
+    st.on_button = fpv_on_button;
+    menu->register_setting(&st);
+
+    fb_action_desc_v1_t act;
+    memset(&act, 0, sizeof(act));
+    act.struct_size = (uint32_t)sizeof(act);
+    act.trigger_mode = (uint32_t)FB_TRIGGER_PRESS;
+    act.mod_id = FPV_MOD_ID;
+    act.action_id = "toggle_fpv";
+    act.label = "Toggle First-Person";
+    act.description = "Toggle on-foot FirstPerson view mode (0 <-> 2)";
+    act.consume_input = 1;
+    act.default_key.code = g_fpv.hotkey_vkey;
+    act.default_key.modifiers = FB_MOD_NONE;
+    act.default_pad.code = FB_PAD_RIGHT_THUMB;
+    act.default_pad.modifiers = FB_PAD_LEFT_SHOULDER; /* LB + R3 */
+    act.callback = fpv_on_action;
+    menu->register_action(&act);
+
+    g_fpv.menu_registered = 1;
+    return FB_OK;
+}
+
 FB_API void fb_plugin_shutdown(void) {
     if (g_fpv.initialized && g_fpv.fpv_latched && g_fpv.core.title_mem_write_u32) {
         g_fpv.core.title_mem_write_u32(g_fpv.view_mode_va, g_fpv.third_person_mode);
         fpv_log(FB_LOG_INFO, "[fpv_toggle] Shutdown restored third-person view_mode=0");
         g_fpv.fpv_latched = 0;
     }
+    g_fpv.menu_registered = 0;
     g_fpv.initialized = 0;
 }
