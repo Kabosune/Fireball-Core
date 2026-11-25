@@ -15,9 +15,11 @@
 extern "C" {
 #endif
 
-#define FB_BUNDLE_MAGIC         0x4E494246u /* "FBIN" little-endian */
-#define FB_BUNDLE_VERSION       1u
-#define FB_BUNDLE_HEADER_SIZE   64u
+#define FB_BUNDLE_MAGIC           0x4E494246u /* "FBIN" little-endian */
+#define FB_BUNDLE_VERSION         1u
+#define FB_BUNDLE_VERSION_V2      2u
+#define FB_BUNDLE_HEADER_SIZE     64u
+#define FB_BUNDLE_HEADER_V2_SIZE  80u
 
 #define FB_DS_FLAG_FULL_ASSET   (1u << 0)
 #define FB_DS_FLAG_PAGE_SLICE   (1u << 1)
@@ -73,11 +75,33 @@ typedef struct fb_bundle_plugin_cfg_entry {
     uint64_t reserved;
 } fb_bundle_plugin_cfg_entry_t;
 
+typedef struct fb_bundle_header_v2 {
+    fb_bundle_header_t v1;
+    uint32_t           shader_count;
+    uint32_t           reserved1;
+    uint64_t           shader_table_off;
+} fb_bundle_header_v2_t;
+
+typedef struct fb_bundle_shader_entry {
+    uint64_t key_hash;             /* FNV-1a 64-bit of container_blake3[32] || dxbc_digest[16] */
+    uint8_t  container_blake3[32];
+    uint8_t  dxbc_digest[16];
+    uint64_t payload_offset;
+    uint32_t payload_size;
+    uint32_t payload_crc32;
+    uint32_t name_offset;          /* Optional effect/shader name in string pool (0 if absent) */
+    uint32_t name_len;
+    uint32_t flags;
+    uint32_t reserved;
+} fb_bundle_shader_entry_t;
+
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 _Static_assert(sizeof(fb_bundle_header_t) == 64, "fb_bundle_header_t must be 64 bytes");
+_Static_assert(sizeof(fb_bundle_header_v2_t) == 80, "fb_bundle_header_v2_t must be 80 bytes");
 _Static_assert(sizeof(fb_bundle_dstorage_entry_t) == 64, "fb_bundle_dstorage_entry_t must be 64 bytes");
 _Static_assert(sizeof(fb_bundle_overlay_entry_t) == 40, "fb_bundle_overlay_entry_t must be 40 bytes");
 _Static_assert(sizeof(fb_bundle_plugin_cfg_entry_t) == 32, "fb_bundle_plugin_cfg_entry_t must be 32 bytes");
+_Static_assert(sizeof(fb_bundle_shader_entry_t) == 88, "fb_bundle_shader_entry_t must be 88 bytes");
 #endif
 
 typedef struct fb_hash_slot {
@@ -89,12 +113,15 @@ typedef struct fb_hash_slot {
 typedef struct fb_bundle {
     uint8_t*                          raw_data;
     size_t                            raw_size;
+    uint32_t                          version;
     const fb_bundle_dstorage_entry_t* ds_entries;
     uint32_t                          ds_count;
     const fb_bundle_overlay_entry_t*  ov_entries;
     uint32_t                          ov_count;
     const fb_bundle_plugin_cfg_entry_t* cfg_entries;
     uint32_t                          cfg_count;
+    const fb_bundle_shader_entry_t*   shader_entries;
+    uint32_t                          shader_count;
 
     /* Open-addressing hash tables for O(1) runtime lookup */
     fb_hash_slot_t* ds_exact_slots;
@@ -108,12 +135,16 @@ typedef struct fb_bundle {
 
     fb_hash_slot_t* cfg_slots;
     uint32_t        cfg_mask;
+
+    fb_hash_slot_t* shader_slots;
+    uint32_t        shader_mask;
 } fb_bundle_t;
 
 /* Hash & normalization utilities */
 uint64_t fb_fnv1a_64(const void* data, size_t len);
 uint64_t fb_dstorage_key_hash(const char* norm_path, size_t path_len, uint64_t file_offset, uint32_t orig_uncomp_size);
 uint64_t fb_dstorage_fallback_hash(const char* norm_path, size_t path_len, uint64_t file_offset);
+uint64_t fb_shader_key_hash(const uint8_t container_blake3[32], const uint8_t dxbc_digest[16]);
 uint32_t fb_crc32_ieee(const void* data, size_t len);
 
 /*
@@ -149,6 +180,11 @@ const fb_bundle_plugin_cfg_entry_t* fb_bundle_find_plugin_cfg(
     const fb_bundle_t* bundle,
     const char*        mod_id,
     size_t             mod_id_len);
+
+const fb_bundle_shader_entry_t* fb_bundle_find_shader(
+    const fb_bundle_t* bundle,
+    const uint8_t      container_blake3[32],
+    const uint8_t      dxbc_digest[16]);
 
 #ifdef __cplusplus
 }

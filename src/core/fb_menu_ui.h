@@ -27,6 +27,8 @@ typedef struct fb_menu_telemetry_ptrs {
     const volatile LONG64* dstorage_buf_too_small;
     const volatile LONG64* file_open_calls;
     const volatile LONG64* file_open_hits;
+    const volatile LONG64* shader_calls;
+    const volatile LONG64* shader_hits;
     const volatile LONG64* input_events;
     const volatile LONG64* input_consumed;
     const volatile LONG64* frames_seen;

@@ -20,12 +20,14 @@ from fireball.abi import verify_c11_headers  # noqa: E402
 from fireball.bundle import (  # noqa: E402
     FB_BUNDLE_MAGIC,
     FB_BUNDLE_VERSION,
+    FB_BUNDLE_VERSION_V2,
     FB_DS_FLAG_FULL_ASSET,
     FB_DS_FLAG_PAGE_SLICE,
     FB_DS_FLAG_TEXT_PATCH,
     BundleDStorageEntry,
     BundleOverlayEntry,
     BundlePluginConfigEntry,
+    BundleShaderEntry,
     CompiledBundle,
     build_patch_bundle,
     dstorage_key_hash,
@@ -33,6 +35,14 @@ from fireball.bundle import (  # noqa: E402
     normalize_rel_path,
     parse_bundle,
     serialize_bundle,
+    shader_key_hash,
+)
+from fireball.load_order import (  # noqa: E402
+    DependencyCycleError,
+    DuplicateModError,
+    MissingDependencyError,
+    ModConflictError,
+    resolve_load_order,
 )
 from fireball.mergers import (  # noqa: E402
     compact_kv_bytes,
@@ -366,6 +376,343 @@ class TestFireballOffline(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--pipe", proc.stdout)
         self.assertIn("--command", proc.stdout)
+
+    def test_v2_shader_bundle_roundtrip_determinism_and_v1_compat(self) -> None:
+        b3_a = bytes(range(32))
+        dxbc_a = bytes(range(0xA0, 0xB0))
+        b3_b = bytes(range(32, 64))
+        dxbc_b = bytes(range(0x10, 0x20))
+
+        sh_a = BundleShaderEntry(
+            container_blake3=b3_a,
+            dxbc_digest=dxbc_a,
+            payload=b"DXBC\x01\x02\x03\x04DXIL_PAYLOAD_A",
+            effect_name="fx_visor_ps",
+        )
+        sh_b = BundleShaderEntry(
+            container_blake3=b3_b,
+            dxbc_digest=dxbc_b,
+            payload=b"DXBC\x05\x06\x07\x08DXIL_PAYLOAD_B",
+            effect_name="",
+        )
+
+        raw1 = serialize_bundle(CompiledBundle(shader_entries=[sh_a, sh_b]))
+        raw2 = serialize_bundle(CompiledBundle(shader_entries=[sh_b, sh_a]))
+        self.assertEqual(raw1, raw2)
+
+        magic, ver = struct.unpack_from("<II", raw1, 0)
+        self.assertEqual(magic, FB_BUNDLE_MAGIC)
+        self.assertEqual(ver, FB_BUNDLE_VERSION_V2)
+
+        parsed = parse_bundle(raw1)
+        self.assertEqual(parsed.bundle_version, FB_BUNDLE_VERSION_V2)
+        self.assertEqual(len(parsed.shader_entries), 2)
+        self.assertEqual(parsed.shader_entries[0].container_blake3, b3_a)
+        self.assertEqual(parsed.shader_entries[0].dxbc_digest, dxbc_a)
+        self.assertEqual(parsed.shader_entries[0].effect_name, "fx_visor_ps")
+        self.assertEqual(parsed.shader_entries[0].payload, sh_a.payload)
+        self.assertEqual(parsed.shader_entries[0].key_hash, shader_key_hash(b3_a, dxbc_a))
+        self.assertEqual(parsed.shader_entries[1].effect_name, "")
+
+        # Corrupting shader DXIL payload must fail CRC32 validation
+        corrupted = bytearray(raw1)
+        corrupted[-16] ^= 0xFF
+        with self.assertRaises(ValueError):
+            parse_bundle(bytes(corrupted))
+
+        # Inspect CLI reports v2 and shader entries cleanly
+        with tempfile.TemporaryDirectory() as td:
+            bpath = os.path.join(td, "v2.fbin")
+            with open(bpath, "wb") as wf:
+                wf.write(raw1)
+            insp = inspect_bundle_file(bpath)
+            self.assertEqual(insp["bundle_version"], FB_BUNDLE_VERSION_V2)
+            self.assertEqual(insp["shader_entry_count"], 2)
+            self.assertEqual(insp["shader_entries"][0]["effect_name"], "fx_visor_ps")
+
+            proc = subprocess.run(
+                [sys.executable, "-B", os.path.join(ROOT, "fireball_cli.py"), "inspect-bundle", bpath],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("(v2,", proc.stdout)
+            self.assertIn("Shader DXIL overrides (2):", proc.stdout)
+            self.assertIn("fx_visor_ps", proc.stdout)
+
+    def _write_minimal_mod(
+        self,
+        parent: str,
+        dirname: str,
+        mod_id: str,
+        *,
+        requires: list[str] | None = None,
+        load_after: list[str] | None = None,
+        conflicts: list[str] | None = None,
+        extra_toml: str = "",
+    ) -> str:
+        mdir = os.path.join(parent, dirname)
+        os.makedirs(mdir, exist_ok=True)
+        req_s = json.dumps(requires or [])
+        aft_s = json.dumps(load_after or [])
+        cnf_s = json.dumps(conflicts or [])
+        with open(os.path.join(mdir, "mod.toml"), "w", encoding="utf-8") as wf:
+            wf.write(
+                f'[mod]\nid = "{mod_id}"\nname = "{mod_id}"\nversion = "1.0.0"\n'
+                f'target_game_version = "1.0.2.1"\nmin_fireball_abi = 1\n\n'
+                f"[dependencies]\nrequires = {req_s}\nload_after = {aft_s}\nconflicts = {cnf_s}\n\n"
+                f"{extra_toml}"
+            )
+        return mdir
+
+    def test_load_order_resolver_topo_sort_errors_and_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            m_base = self._write_minimal_mod(td, "base", "test.base")
+            m_mid = self._write_minimal_mod(
+                td, "mid", "test.mid", requires=["test.base"], load_after=["test.missing_soft"]
+            )
+            m_top = self._write_minimal_mod(
+                td, "top", "test.top", requires=["test.mid"], load_after=["test.base"]
+            )
+            m_top_zip = os.path.join(td, "top.gta6mod")
+            pack_mod_to_zip(m_top, m_top_zip)
+
+            # Deterministic topological sort regardless of scrambled input order (loose + .gta6mod)
+            res1 = resolve_load_order([m_top_zip, m_mid, m_base])
+            res2 = resolve_load_order([m_mid, m_base, m_top_zip])
+            self.assertEqual([m.mod_id for m in res1.ordered], ["test.base", "test.mid", "test.top"])
+            self.assertEqual([m.mod_id for m in res2.ordered], ["test.base", "test.mid", "test.top"])
+
+            # Missing dependency error
+            with self.assertRaises(MissingDependencyError) as ctx_miss:
+                resolve_load_order([m_mid])
+            self.assertIn("test.base", str(ctx_miss.exception))
+
+            # Duplicate mod id error
+            m_base_dup = self._write_minimal_mod(td, "base_dup", "test.base")
+            with self.assertRaises(DuplicateModError) as ctx_dup:
+                resolve_load_order([m_base, m_base_dup])
+            self.assertIn("test.base", str(ctx_dup.exception))
+
+            # Declared conflict error
+            m_conf = self._write_minimal_mod(td, "conf", "test.conf", conflicts=["test.base"])
+            with self.assertRaises(ModConflictError) as ctx_conf:
+                resolve_load_order([m_base, m_conf])
+            self.assertIn("test.conf", str(ctx_conf.exception))
+            self.assertIn("test.base", str(ctx_conf.exception))
+
+            # Cycle error (a -> b -> a)
+            m_c1 = self._write_minimal_mod(td, "cyc1", "test.cyc1", requires=["test.cyc2"])
+            m_c2 = self._write_minimal_mod(td, "cyc2", "test.cyc2", load_after=["test.cyc1"])
+            with self.assertRaises(DependencyCycleError) as ctx_cyc:
+                resolve_load_order([m_c1, m_c2])
+            self.assertIn("test.cyc1", str(ctx_cyc.exception))
+            self.assertIn("test.cyc2", str(ctx_cyc.exception))
+
+            # load_order.toml profile: explicit ordering, enable/disable, and overrides
+            m_x = self._write_minimal_mod(td, "mod_x", "test.x")
+            m_y = self._write_minimal_mod(td, "mod_y", "test.y")
+            m_z = self._write_minimal_mod(td, "mod_z", "test.z")
+            prof_path = os.path.join(td, "load_order.toml")
+            with open(prof_path, "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[profile]\n'
+                    'name = "custom"\n'
+                    'size_preserve = true\n'
+                    'order = ["test.y", "test.x"]\n\n'
+                    '[[mods]]\npath = "mod_x"\nenabled = true\n'
+                    '[mods.overrides]\npatches = { p1 = false }\nplugin_config = { k = 1 }\n\n'
+                    '[[mods]]\npath = "mod_y"\nenabled = true\n\n'
+                    '[[mods]]\npath = "mod_z"\nenabled = false\n\n'
+                    '[overrides."test.x".plugin_config]\n'
+                    'k = 2\nextra = true\n'
+                )
+            pres = resolve_load_order(profile_path=prof_path)
+            self.assertEqual([m.mod_id for m in pres.ordered], ["test.y", "test.x"])
+            self.assertEqual(len(pres.disabled), 1)
+            self.assertEqual(pres.disabled[0]["mod_id"], "test.z")
+            self.assertTrue(pres.size_preserve)
+            self.assertEqual(pres.mod_overrides["test.x"]["patches"], {"p1": False})
+            self.assertEqual(pres.mod_overrides["test.x"]["plugin_config"], {"extra": True, "k": 2})
+
+    def test_stage_cli_conflicts_plugins_shaders_and_profile_overrides(self) -> None:
+        # 1. `stage --help` works without game dir
+        env = dict(os.environ)
+        env["GTA6_DIR"] = os.path.join(ROOT, "__nonexistent_game__")
+        hproc = subprocess.run(
+            [sys.executable, "-B", os.path.join(ROOT, "fireball_cli.py"), "stage", "--help"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(hproc.returncode, 0, hproc.stderr)
+        self.assertIn("--profile", hproc.stdout)
+        self.assertIn("--plugin-dir", hproc.stdout)
+        self.assertIn("--core-dll", hproc.stdout)
+
+        # 2. Full end-to-end stage with XML + KV + overlay + shader conflicts, plugin copy, core DLL copy
+        with tempfile.TemporaryDirectory() as td:
+            game_dir = os.path.join(td, "game")
+            out_dir = os.path.join(td, "staged")
+            pdir = os.path.join(td, "bin_release")
+            os.makedirs(game_dir, exist_ok=True)
+            os.makedirs(pdir, exist_ok=True)
+
+            # Synthetic game archive containing both an XML at 0x100 and a KV at 0x800
+            xml_raw = b'<Root>\n  <Flag value="0" />\n  <Other value="orig" />\n</Root>\n'
+            kv_raw = b"visual.alpha\t\t1.0\nvisual.beta\t\t2.0\n"
+            c_xml = zlib.compress(xml_raw, level=9)
+            c_kv = zlib.compress(kv_raw, level=9)
+            arch = bytearray(0x100)
+            arch.extend(c_xml)
+            while len(arch) < 0x800:
+                arch.append(0)
+            arch.extend(c_kv)
+            with open(os.path.join(game_dir, "common.rpf"), "wb") as wf:
+                wf.write(arch)
+
+            # Fake built plugin DLL and fake fireball_core.dll in pdir
+            with open(os.path.join(pdir, "mod_b.fbplugin.dll"), "wb") as wf:
+                wf.write(b"MZ_FAKE_PLUGIN_B")
+            with open(os.path.join(pdir, "unused_other.fbplugin.dll"), "wb") as wf:
+                wf.write(b"MZ_UNUSED")
+            core_src = os.path.join(pdir, "fireball_core.dll")
+            with open(core_src, "wb") as wf:
+                wf.write(b"MZ_FAKE_CORE")
+
+            b3_hex = bytes(range(32)).hex()
+            dxbc_hex = bytes(range(16)).hex()
+
+            # Mod A (loads first): patches Flag=1, visual.alpha=0.5, overlay, shader, embedded plugin
+            mod_a = self._write_minimal_mod(
+                td,
+                "mod_a",
+                "test.mod_a",
+                extra_toml=(
+                    '[[patches.xml]]\nid = "xml_a"\ntarget = "common:/t.meta"\narchive = "common.rpf"\n'
+                    'archive_offset = "0x100"\npatch = "patches/x.toml"\n'
+                    '[[patches.xml]]\nid = "xml_disabled_by_profile"\ntarget = "common:/t.meta"\narchive = "common.rpf"\n'
+                    'archive_offset = "0x100"\npatch = "patches/x_off.toml"\n'
+                    '[[patches.kv]]\nid = "kv_a"\ntarget = "commoncrc:/vs"\narchive = "common.rpf"\n'
+                    'archive_offset = "0x800"\npatch = "patches/k.toml"\n'
+                    '[[patches.shaders]]\nid = "sh_a"\n'
+                    f'container_blake3 = "{b3_hex}"\ndxbc_digest = "{dxbc_hex}"\n'
+                    'effect_name = "fx_test"\ndxil = "shaders/a.dxil"\n'
+                    '[[plugins]]\nid = "mod_a"\nentry = "none.py"\nnative_path = "bin/mod_a.fbplugin.dll"\n'
+                    '[plugins.config]\nspeed = 1\n'
+                ),
+            )
+            os.makedirs(os.path.join(mod_a, "patches"), exist_ok=True)
+            os.makedirs(os.path.join(mod_a, "overlays", "data"), exist_ok=True)
+            os.makedirs(os.path.join(mod_a, "shaders"), exist_ok=True)
+            os.makedirs(os.path.join(mod_a, "bin"), exist_ok=True)
+            with open(os.path.join(mod_a, "patches", "x.toml"), "w", encoding="utf-8") as wf:
+                wf.write('[[ops]]\nop = "set_attr"\ntag = "Flag"\nattr = "value"\nvalue = "1"\n')
+            with open(os.path.join(mod_a, "patches", "x_off.toml"), "w", encoding="utf-8") as wf:
+                wf.write('[[ops]]\nop = "set_attr"\ntag = "Other"\nattr = "value"\nvalue = "bad"\n')
+            with open(os.path.join(mod_a, "patches", "k.toml"), "w", encoding="utf-8") as wf:
+                wf.write('[[ops]]\nop = "set"\nkey = "visual.alpha"\nvalue = "0.5"\n')
+            with open(os.path.join(mod_a, "overlays", "data", "shared.txt"), "wb") as wf:
+                wf.write(b"overlay-A")
+            with open(os.path.join(mod_a, "shaders", "a.dxil"), "wb") as wf:
+                wf.write(b"DXIL_MOD_A_BYTES")
+            with open(os.path.join(mod_a, "bin", "mod_a.fbplugin.dll"), "wb") as wf:
+                wf.write(b"MZ_FAKE_PLUGIN_A")
+
+            # Mod B (requires Mod A, overrides Flag=2, visual.alpha=0.25, overlay, shader, plugin from --plugin-dir)
+            mod_b = self._write_minimal_mod(
+                td,
+                "mod_b",
+                "test.mod_b",
+                requires=["test.mod_a"],
+                extra_toml=(
+                    '[[patches.xml]]\nid = "xml_b"\ntarget = "common:/t.meta"\narchive = "common.rpf"\n'
+                    'archive_offset = "0x100"\npatch = "patches/x.toml"\n'
+                    '[[patches.kv]]\nid = "kv_b"\ntarget = "commoncrc:/vs"\narchive = "common.rpf"\n'
+                    'archive_offset = "0x800"\npatch = "patches/k.toml"\n'
+                    '[[patches.shaders]]\nid = "sh_b"\n'
+                    f'container_blake3 = "{b3_hex}"\ndxbc_digest = "{dxbc_hex}"\n'
+                    'effect_name = "fx_test"\ndxil = "shaders/b.dxil"\n'
+                    '[[plugins]]\nid = "mod_b"\nentry = "none.py"\nnative_path = "bin/mod_b.fbplugin.dll"\n'
+                ),
+            )
+            os.makedirs(os.path.join(mod_b, "patches"), exist_ok=True)
+            os.makedirs(os.path.join(mod_b, "overlays", "data"), exist_ok=True)
+            os.makedirs(os.path.join(mod_b, "shaders"), exist_ok=True)
+            with open(os.path.join(mod_b, "patches", "x.toml"), "w", encoding="utf-8") as wf:
+                wf.write('[[ops]]\nop = "set_attr"\ntag = "Flag"\nattr = "value"\nvalue = "2"\n')
+            with open(os.path.join(mod_b, "patches", "k.toml"), "w", encoding="utf-8") as wf:
+                wf.write('[[ops]]\nop = "set"\nkey = "visual.alpha"\nvalue = "0.25"\n')
+            with open(os.path.join(mod_b, "overlays", "data", "shared.txt"), "wb") as wf:
+                wf.write(b"overlay-B-winner")
+            with open(os.path.join(mod_b, "shaders", "b.dxil"), "wb") as wf:
+                wf.write(b"DXIL_MOD_B_WINNER")
+
+            # Profile passes Mod B before Mod A, disables xml_disabled_by_profile, and overrides mod_a plugin config
+            prof_path = os.path.join(td, "load_order.toml")
+            with open(prof_path, "w", encoding="utf-8") as wf:
+                wf.write(
+                    '[profile]\nname = "stage_test"\nsize_preserve = true\n\n'
+                    '[[mods]]\npath = "mod_b"\n'
+                    '[[mods]]\npath = "mod_a"\n\n'
+                    '[overrides."test.mod_a".patches]\nxml_disabled_by_profile = false\n'
+                    '[overrides."test.mod_a".plugin_config]\nspeed = 9\n'
+                )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    os.path.join(ROOT, "fireball_cli.py"),
+                    "--game-dir",
+                    game_dir,
+                    "--out",
+                    out_dir,
+                    "stage",
+                    "--profile",
+                    prof_path,
+                    "--plugin-dir",
+                    pdir,
+                    "--core-dll",
+                    core_src,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("winner=test.mod_b", proc.stdout)
+
+            # Verify copied binaries (only staged mods' plugins + core DLL, NOT unused_other)
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "fireball_core.dll")))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "mod_a.fbplugin.dll")))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "mod_b.fbplugin.dll")))
+            self.assertFalse(os.path.isfile(os.path.join(out_dir, "unused_other.fbplugin.dll")))
+
+            # Verify conflicts JSON records all 4 conflicts (xml, kv, overlay, shader) won by test.mod_b
+            with open(os.path.join(out_dir, "fireball_conflicts.json"), "r", encoding="utf-8") as rf:
+                crep = json.load(rf)
+            self.assertEqual(crep["load_order"], ["test.mod_a", "test.mod_b"])
+            self.assertEqual(crep["conflict_count"], 4)
+            by_kind = {c["kind"]: c for c in crep["conflicts"]}
+            self.assertEqual(set(by_kind.keys()), {"xml", "kv", "overlay", "shader"})
+            for kind, entry in by_kind.items():
+                self.assertEqual(entry["winner_mod"], "test.mod_b", kind)
+                self.assertEqual(entry["overridden_mods"], ["test.mod_a"], kind)
+
+            # Verify compiled bundle reflects profile overrides & load-order winners
+            with open(os.path.join(out_dir, "fireball_bundle.fbin"), "rb") as rf:
+                parsed = parse_bundle(rf.read())
+            self.assertEqual(parsed.bundle_version, FB_BUNDLE_VERSION_V2)
+            ds_by_off = {e.file_offset: e for e in parsed.dstorage_entries}
+            self.assertIn(b'Flag value="2"', ds_by_off[0x100].payload)
+            self.assertIn(b'Other value="orig"', ds_by_off[0x100].payload)  # disabled by profile!
+            self.assertIn(b"0.25", ds_by_off[0x800].payload)
+            self.assertEqual(parsed.overlay_entries[0].payload, b"overlay-B-winner")
+            self.assertEqual(parsed.shader_entries[0].payload, b"DXIL_MOD_B_WINNER")
+            self.assertEqual(json.loads(parsed.plugin_configs[0].config_json), {"speed": 9})
 
 
 if __name__ == "__main__":

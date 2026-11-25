@@ -14,6 +14,7 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ if _ROOT_DIR not in sys.path:
 from fireball.abi import verify_c11_headers  # noqa: E402
 from fireball.archive_reader import parse_int_hex, read_paged_zlib_at, read_single_zlib_chunk_at  # noqa: E402
 from fireball.bundle import build_patch_bundle, inspect_bundle_file  # noqa: E402
+from fireball.load_order import LoadOrderError, resolve_load_order  # noqa: E402
 from fireball.mergers import merge_kv_bytes, merge_xml_bytes  # noqa: E402
 from fireball.mock_host import run_mock_host_suite  # noqa: E402
 from fireball.mod_source import load_manifest, open_mod_source, pack_mod_to_zip  # noqa: E402
@@ -347,6 +349,233 @@ def cmd_inspect_bundle(args: argparse.Namespace) -> int:
     print(f"Plugin configs ({info['plugin_config_count']}):")
     for c in info["plugin_configs"]:
         print(f"  {c['mod_id']} ({c['json_len']} B JSON)")
+    print(f"Shader DXIL overrides ({info['shader_entry_count']}):")
+    for s in info["shader_entries"]:
+        eff = f" effect='{s['effect_name']}'" if s["effect_name"] else ""
+        print(
+            f"  blake3={s['container_blake3'][:16]}... dxbc={s['dxbc_digest']} "
+            f"({s['payload_size']:,} B, crc32={s['payload_crc32']}){eff}"
+        )
+    return 0
+
+
+def _stage_native_plugins(
+    ordered_mods: List[Any],
+    out_dir: str,
+    plugin_dirs: List[str],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    Copy `*.fbplugin.dll` binaries referenced by or embedded inside staged mods
+    into `out_dir`. Searches each mod source first, then `--plugin-dir` directories.
+    Returns `(copied_plugins, missing_plugins)`.
+    """
+    copied: List[Dict[str, str]] = []
+    missing: List[Dict[str, str]] = []
+    copied_by_name: Dict[str, str] = {}
+
+    for rm in ordered_mods:
+        with open_mod_source(rm.source_path) as src:
+            embedded_dlls: Dict[str, str] = {}
+            for rel in src.list_files():
+                if rel.lower().endswith(".fbplugin.dll"):
+                    embedded_dlls[os.path.basename(rel).lower()] = rel
+
+            # 1. Copy every *.fbplugin.dll embedded in the mod source
+            for base_low, rel in sorted(embedded_dlls.items()):
+                base_name = os.path.basename(rel)
+                dst_path = os.path.join(out_dir, base_name)
+                with open(dst_path, "wb") as wf:
+                    wf.write(src.read_bytes(rel))
+                copied_by_name[base_low] = dst_path
+                copied.append(
+                    {
+                        "mod_id": rm.mod_id,
+                        "plugin_file": base_name,
+                        "source": f"{rm.source_path}:{rel}",
+                        "dest": os.path.abspath(dst_path),
+                    }
+                )
+
+            # 2. Resolve any declared `[[plugins]]` native binaries from mod or `--plugin-dir`
+            for plg in rm.manifest.plugins:
+                native_path = str(plg.get("native_path", "")).strip()
+                plg_id = str(plg.get("id", "")).strip()
+                candidates: List[str] = []
+                if native_path:
+                    candidates.append(os.path.basename(native_path.replace("\\", "/")))
+                if plg_id:
+                    cand_id = f"{plg_id}.fbplugin.dll"
+                    if cand_id.lower() not in [c.lower() for c in candidates]:
+                        candidates.append(cand_id)
+
+                if not candidates:
+                    continue
+                if any(c.lower() in copied_by_name for c in candidates):
+                    continue
+
+                found_src: Optional[str] = None
+                found_name: Optional[str] = None
+                for pdir in plugin_dirs:
+                    for cand in candidates:
+                        probe = os.path.join(pdir, cand)
+                        if os.path.isfile(probe):
+                            found_src = os.path.abspath(probe)
+                            found_name = cand
+                            break
+                    if found_src:
+                        break
+
+                if found_src and found_name:
+                    dst_path = os.path.join(out_dir, found_name)
+                    if os.path.normcase(os.path.abspath(dst_path)) != os.path.normcase(found_src):
+                        shutil.copy2(found_src, dst_path)
+                    copied_by_name[found_name.lower()] = dst_path
+                    copied.append(
+                        {
+                            "mod_id": rm.mod_id,
+                            "plugin_file": found_name,
+                            "source": found_src,
+                            "dest": os.path.abspath(dst_path),
+                        }
+                    )
+                else:
+                    missing.append(
+                        {
+                            "mod_id": rm.mod_id,
+                            "plugin_id": plg_id,
+                            "expected": candidates[0],
+                        }
+                    )
+
+    return copied, missing
+
+
+def cmd_stage(args: argparse.Namespace) -> int:
+    _check_out_not_in_game_dir(args.out, args.game_dir)
+    if not args.mod and not args.profile:
+        print("Stage error: pass at least one --mod or --profile <load_order.toml>.", file=sys.stderr)
+        return 1
+
+    try:
+        resolution = resolve_load_order(args.mod or [], profile_path=args.profile)
+    except (LoadOrderError, FileNotFoundError, ValueError) as exc:
+        print(f"Load-order resolution failed: {exc}", file=sys.stderr)
+        return 1
+
+    os.makedirs(args.out, exist_ok=True)
+    extra_overlays: Dict[str, bytes] = {}
+    for spec in args.overlay or []:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --overlay '{spec}': expected TARGET_REL_PATH=SOURCE_FILE")
+        target_rel, src_file = spec.split("=", 1)
+        with open(src_file, "rb") as rf:
+            extra_overlays[target_rel] = rf.read()
+
+    effective_size_preserve = bool(args.size_preserve) or bool(resolution.size_preserve)
+    effective_bundle_name = args.bundle_name or resolution.bundle_name or "fireball_bundle.fbin"
+
+    bundle_rep = build_patch_bundle(
+        resolution.mod_paths,
+        args.game_dir,
+        args.out,
+        bundle_filename=effective_bundle_name,
+        extra_overlays=extra_overlays or None,
+        mod_overrides=resolution.mod_overrides or None,
+        size_preserve=effective_size_preserve,
+        tools_dir=args.tools_dir,
+    )
+
+    plugin_dirs = [os.path.abspath(d) for d in (args.plugin_dir or [])]
+    copied_plugins, missing_plugins = _stage_native_plugins(resolution.ordered, args.out, plugin_dirs)
+
+    copied_core_dll: Optional[str] = None
+    if args.core_dll:
+        src_core = os.path.abspath(args.core_dll)
+        if not os.path.isfile(src_core):
+            print(f"Stage error: --core-dll not found: {src_core}", file=sys.stderr)
+            return 1
+        dst_core = os.path.join(args.out, os.path.basename(src_core))
+        if os.path.normcase(os.path.abspath(dst_core)) != os.path.normcase(src_core):
+            shutil.copy2(src_core, dst_core)
+        copied_core_dll = os.path.abspath(dst_core)
+
+    conflicts = bundle_rep.get("conflicts", [])
+    conflicts_report = {
+        "load_order": [m.mod_id for m in resolution.ordered],
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }
+    conflicts_path = os.path.join(args.out, "fireball_conflicts.json")
+    with open(conflicts_path, "w", encoding="utf-8") as wf:
+        json.dump(conflicts_report, wf, indent=2)
+
+    stage_report = {
+        "out_dir": os.path.abspath(args.out),
+        "profile_path": resolution.profile_path,
+        "profile_name": resolution.profile_name,
+        "load_order": [m.to_summary_dict() for m in resolution.ordered],
+        "disabled_mods": resolution.disabled,
+        "bundle_file": bundle_rep["bundle_file"],
+        "bundle_version": bundle_rep["bundle_version"],
+        "bundle_size_bytes": bundle_rep["bundle_size_bytes"],
+        "size_preserve": effective_size_preserve,
+        "all_fit_fixed_dst": bundle_rep["all_fit_fixed_dst"],
+        "provenance_file": bundle_rep["provenance_file"],
+        "conflicts_file": os.path.abspath(conflicts_path),
+        "dstorage_entry_count": bundle_rep["dstorage_entry_count"],
+        "overlay_entry_count": bundle_rep["overlay_entry_count"],
+        "plugin_config_count": bundle_rep["plugin_config_count"],
+        "shader_entry_count": bundle_rep["shader_entry_count"],
+        "copied_plugins": copied_plugins,
+        "missing_plugins": missing_plugins,
+        "copied_core_dll": copied_core_dll,
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }
+    stage_report_path = os.path.join(args.out, "fireball_stage_report.json")
+    with open(stage_report_path, "w", encoding="utf-8") as wf:
+        json.dump(stage_report, wf, indent=2)
+    stage_report["stage_report_file"] = os.path.abspath(stage_report_path)
+
+    if args.json:
+        print(json.dumps(stage_report, indent=2))
+        return 0
+
+    print(f"Staged {len(resolution.ordered)} mod(s) into: {stage_report['out_dir']}")
+    print("Load order:")
+    for m in resolution.ordered:
+        print(f"  {m.load_index + 1}. {m.mod_id} v{m.version} ({m.source_kind}: {m.source_path})")
+    if resolution.disabled:
+        print(f"Disabled mods ({len(resolution.disabled)}):")
+        for d in resolution.disabled:
+            print(f"  - {d['mod_id']} ({d['reason']})")
+    print(
+        f"Bundle: {stage_report['bundle_file']} (v{stage_report['bundle_version']}, "
+        f"{stage_report['bundle_size_bytes']:,} B, ds={stage_report['dstorage_entry_count']}, "
+        f"ov={stage_report['overlay_entry_count']}, cfg={stage_report['plugin_config_count']}, "
+        f"shaders={stage_report['shader_entry_count']}, all_fit_fixed_dst={stage_report['all_fit_fixed_dst']})"
+    )
+    print(f"Native plugins copied ({len(copied_plugins)}):")
+    for cp in copied_plugins:
+        print(f"  {cp['plugin_file']} <- {cp['source']}")
+    if missing_plugins:
+        print(f"Native plugins not found ({len(missing_plugins)}):")
+        for mp in missing_plugins:
+            print(f"  ! {mp['expected']} (mod={mp['mod_id']})")
+    if copied_core_dll:
+        print(f"Core DLL copied: {copied_core_dll}")
+    print(f"Field/overlay/shader conflicts ({len(conflicts)}):")
+    if not conflicts:
+        print("  (none)")
+    else:
+        for c in conflicts:
+            overridden = ", ".join(c["overridden_mods"])
+            print(
+                f"  [{c['kind']}] {c['target']} :: {c['field']} -> "
+                f"winner={c['winner_mod']} (overrides: {overridden}; value={c['winning_value']})"
+            )
+    print(f"Conflicts JSON: {stage_report['conflicts_file']}")
+    print(f"Provenance JSON: {stage_report['provenance_file']}")
     return 0
 
 
@@ -743,6 +972,54 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.add_argument("bundle", help="Path to fireball_bundle.fbin")
     p_ins.add_argument("--json", action="store_true", help="Emit structured JSON instead of a table")
 
+    p_stg = sub.add_parser(
+        "stage",
+        help="Resolve multi-mod load order, build bundle + provenance + conflict report, and copy native DLLs.",
+    )
+    p_stg.add_argument(
+        "--mod",
+        action="append",
+        default=None,
+        help="Mod folder or .gta6mod ZIP (repeatable)",
+    )
+    p_stg.add_argument(
+        "--profile",
+        default=None,
+        help="Path to a load_order.toml profile file",
+    )
+    p_stg.add_argument(
+        "--plugin-dir",
+        action="append",
+        default=None,
+        help="Directory to search for built *.fbplugin.dll binaries (repeatable, e.g. build/Release)",
+    )
+    p_stg.add_argument(
+        "--core-dll",
+        default=None,
+        help="Optional path to fireball_core.dll to copy into --out",
+    )
+    p_stg.add_argument(
+        "--overlay",
+        action="append",
+        default=None,
+        help="Optional extra loose-file overlay as TARGET_REL_PATH=LOCAL_SOURCE_FILE (repeatable)",
+    )
+    p_stg.add_argument(
+        "--bundle-name",
+        default=None,
+        help="Output bundle filename under --out (default: profile value or fireball_bundle.fbin)",
+    )
+    p_stg.add_argument(
+        "--size-preserve",
+        action="store_true",
+        help="Reclaim non-semantic whitespace/comments in grown XML/KV pages so payload_size <= orig_uncomp_size",
+    )
+    p_stg.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the full staging report as JSON to stdout",
+    )
+
     p_con = sub.add_parser(
         "console",
         help="Attach to a live Fireball-Core named-pipe console (interactive REPL or one-shot -c).",
@@ -782,6 +1059,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "simulate": cmd_simulate,
         "build-bundle": cmd_build_bundle,
         "inspect-bundle": cmd_inspect_bundle,
+        "stage": cmd_stage,
         "console": cmd_console,
         "verify-all": cmd_verify_all,
     }

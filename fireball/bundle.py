@@ -35,11 +35,14 @@ from .pso_patcher import patch_pso_bytes
 
 FB_BUNDLE_MAGIC = 0x4E494246  # "FBIN" little-endian
 FB_BUNDLE_VERSION = 1
+FB_BUNDLE_VERSION_V2 = 2
 FB_BUNDLE_HEADER_SIZE = 64
+FB_BUNDLE_HEADER_V2_SIZE = 80
 
 FB_DS_ENTRY_SIZE = 64
 FB_OVERLAY_ENTRY_SIZE = 40
 FB_PLUGIN_CFG_ENTRY_SIZE = 32
+FB_SHADER_ENTRY_SIZE = 88
 
 FB_DS_FLAG_FULL_ASSET = 1 << 0
 FB_DS_FLAG_PAGE_SLICE = 1 << 1
@@ -47,14 +50,18 @@ FB_DS_FLAG_TEXT_PATCH = 1 << 2
 FB_DS_FLAG_PSO_PATCH = 1 << 3
 
 _HEADER_STRUCT = struct.Struct("<IIIIIIIIQQQQ")
+_HEADER_V2_EXT_STRUCT = struct.Struct("<IIQ")
 _DS_ENTRY_STRUCT = struct.Struct("<QQIIQIIIIQII")
 _OVERLAY_ENTRY_STRUCT = struct.Struct("<QQQIIII")
 _PLUGIN_CFG_STRUCT = struct.Struct("<QIIIIQ")
+_SHADER_ENTRY_STRUCT = struct.Struct("<Q32s16sQIIIIII")
 
 assert _HEADER_STRUCT.size == FB_BUNDLE_HEADER_SIZE
+assert _HEADER_STRUCT.size + _HEADER_V2_EXT_STRUCT.size == FB_BUNDLE_HEADER_V2_SIZE
 assert _DS_ENTRY_STRUCT.size == FB_DS_ENTRY_SIZE
 assert _OVERLAY_ENTRY_STRUCT.size == FB_OVERLAY_ENTRY_SIZE
 assert _PLUGIN_CFG_STRUCT.size == FB_PLUGIN_CFG_ENTRY_SIZE
+assert _SHADER_ENTRY_STRUCT.size == FB_SHADER_ENTRY_SIZE
 
 _FNV1A_64_OFFSET = 0xCBF29CE484222325
 _FNV1A_64_PRIME = 0x00000100000001B3
@@ -84,6 +91,29 @@ def fnv1a_64(data: bytes) -> int:
 def dstorage_key_hash(norm_path: str, file_offset: int, orig_uncomp_size: int) -> int:
     key = norm_path.encode("utf-8") + b"\x00" + struct.pack("<QI", file_offset, orig_uncomp_size)
     return fnv1a_64(key)
+
+
+def parse_hex_bytes(value: str, expected_len: int, field_name: str = "hex") -> bytes:
+    """Parse a hex string (optional 0x prefix, whitespace/dashes ignored) into exact-length bytes."""
+    cleaned = value.strip()
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.replace(" ", "").replace("-", "").replace("_", "")
+    try:
+        raw = bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid hex string for {field_name}: {value!r}") from exc
+    if len(raw) != expected_len:
+        raise ValueError(f"{field_name} must be {expected_len} bytes ({expected_len * 2} hex chars), got {len(raw)} bytes")
+    return raw
+
+
+def shader_key_hash(container_blake3: bytes, dxbc_digest: bytes) -> int:
+    if len(container_blake3) != 32:
+        raise ValueError(f"container_blake3 must be 32 bytes, got {len(container_blake3)}")
+    if len(dxbc_digest) != 16:
+        raise ValueError(f"dxbc_digest must be 16 bytes, got {len(dxbc_digest)}")
+    return fnv1a_64(container_blake3 + dxbc_digest)
 
 
 def _align16(val: int) -> int:
@@ -141,20 +171,61 @@ class BundlePluginConfigEntry:
 
 
 @dataclass
+class BundleShaderEntry:
+    container_blake3: bytes
+    dxbc_digest: bytes
+    payload: bytes
+    effect_name: str = ""
+    flags: int = 0
+
+    def __post_init__(self) -> None:
+        if len(self.container_blake3) != 32:
+            raise ValueError(f"container_blake3 must be 32 bytes, got {len(self.container_blake3)}")
+        if len(self.dxbc_digest) != 16:
+            raise ValueError(f"dxbc_digest must be 16 bytes, got {len(self.dxbc_digest)}")
+
+    @property
+    def key_hash(self) -> int:
+        return shader_key_hash(self.container_blake3, self.dxbc_digest)
+
+    @property
+    def payload_crc32(self) -> int:
+        return binascii.crc32(self.payload) & 0xFFFFFFFF
+
+
+@dataclass
 class CompiledBundle:
     dstorage_entries: List[BundleDStorageEntry] = field(default_factory=list)
     overlay_entries: List[BundleOverlayEntry] = field(default_factory=list)
     plugin_configs: List[BundlePluginConfigEntry] = field(default_factory=list)
+    shader_entries: List[BundleShaderEntry] = field(default_factory=list)
+    bundle_version: int = FB_BUNDLE_VERSION
 
 
-def serialize_bundle(bundle: CompiledBundle) -> bytes:
-    """Serialize a CompiledBundle into deterministic `fireball_bundle.fbin` bytes."""
+def serialize_bundle(bundle: CompiledBundle, *, force_version: Optional[int] = None) -> bytes:
+    """
+    Serialize a CompiledBundle into deterministic `fireball_bundle.fbin` bytes.
+
+    Emits v1 (64-byte header) when `shader_entries` is empty (keeping bundles
+    readable by older v1 readers), or v2 (80-byte header with shader DXIL
+    override table) when `shader_entries` is non-empty or `force_version=2`.
+    """
     ds_sorted = sorted(
         bundle.dstorage_entries,
         key=lambda e: (e.archive_path, e.file_offset, e.orig_uncomp_size),
     )
     ov_sorted = sorted(bundle.overlay_entries, key=lambda e: e.rel_path)
     cfg_sorted = sorted(bundle.plugin_configs, key=lambda e: e.mod_id)
+    sh_sorted = sorted(bundle.shader_entries, key=lambda e: (e.container_blake3, e.dxbc_digest))
+
+    if force_version is not None:
+        if force_version not in (FB_BUNDLE_VERSION, FB_BUNDLE_VERSION_V2):
+            raise ValueError(f"Unsupported bundle version: {force_version}")
+        if force_version == FB_BUNDLE_VERSION and sh_sorted:
+            raise ValueError("Cannot serialize shader overrides into a v1 bundle; use v2")
+        version = force_version
+    else:
+        version = FB_BUNDLE_VERSION_V2 if sh_sorted else FB_BUNDLE_VERSION
 
     # Check for duplicate keys before writing
     seen_ds: set[Tuple[str, int, int]] = set()
@@ -176,10 +247,21 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
             raise ValueError(f"Duplicate plugin config key: {e.mod_id}")
         seen_cfg.add(e.mod_id)
 
-    dstorage_table_off = FB_BUNDLE_HEADER_SIZE
+    seen_sh: set[Tuple[bytes, bytes]] = set()
+    for e in sh_sorted:
+        sk = (e.container_blake3, e.dxbc_digest)
+        if sk in seen_sh:
+            raise ValueError(f"Duplicate shader bundle key: ({e.container_blake3.hex()}, {e.dxbc_digest.hex()})")
+        seen_sh.add(sk)
+
+    header_size = FB_BUNDLE_HEADER_V2_SIZE if version == FB_BUNDLE_VERSION_V2 else FB_BUNDLE_HEADER_SIZE
+    dstorage_table_off = header_size
     overlay_table_off = dstorage_table_off + len(ds_sorted) * FB_DS_ENTRY_SIZE
     plugin_cfg_table_off = overlay_table_off + len(ov_sorted) * FB_OVERLAY_ENTRY_SIZE
-    string_pool_start = plugin_cfg_table_off + len(cfg_sorted) * FB_PLUGIN_CFG_ENTRY_SIZE
+    shader_table_off = plugin_cfg_table_off + len(cfg_sorted) * FB_PLUGIN_CFG_ENTRY_SIZE
+    string_pool_start = shader_table_off + (
+        len(sh_sorted) * FB_SHADER_ENTRY_SIZE if version == FB_BUNDLE_VERSION_V2 else 0
+    )
 
     # Deterministic deduplicated UTF-8 NUL-terminated string pool
     all_strings: set[str] = set()
@@ -190,6 +272,9 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
     for e in cfg_sorted:
         all_strings.add(e.mod_id)
         all_strings.add(e.config_json)
+    for e in sh_sorted:
+        if e.effect_name:
+            all_strings.add(e.effect_name)
 
     string_pool = bytearray()
     str_offsets: Dict[str, Tuple[int, int]] = {}
@@ -221,15 +306,24 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
         if pad:
             payload_blob.extend(b"\x00" * pad)
 
+    sh_payload_offs: List[int] = []
+    for e in sh_sorted:
+        cur_off = payload_start + len(payload_blob)
+        sh_payload_offs.append(cur_off)
+        payload_blob.extend(e.payload)
+        pad = _align16(len(e.payload)) - len(e.payload)
+        if pad:
+            payload_blob.extend(b"\x00" * pad)
+
     total_size = payload_start + len(payload_blob)
 
     out = bytearray()
     out.extend(
         _HEADER_STRUCT.pack(
             FB_BUNDLE_MAGIC,
-            FB_BUNDLE_VERSION,
+            version,
             0,  # flags
-            FB_BUNDLE_HEADER_SIZE,
+            header_size,
             len(ds_sorted),
             len(ov_sorted),
             len(cfg_sorted),
@@ -240,6 +334,14 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
             total_size,
         )
     )
+    if version == FB_BUNDLE_VERSION_V2:
+        out.extend(
+            _HEADER_V2_EXT_STRUCT.pack(
+                len(sh_sorted),
+                0,  # reserved1
+                shader_table_off if sh_sorted else 0,
+            )
+        )
 
     for e, p_off in zip(ds_sorted, ds_payload_offs):
         s_off, s_len = str_offsets[e.archive_path]
@@ -288,6 +390,27 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
             )
         )
 
+    if version == FB_BUNDLE_VERSION_V2:
+        for e, p_off in zip(sh_sorted, sh_payload_offs):
+            if e.effect_name:
+                n_off, n_len = str_offsets[e.effect_name]
+            else:
+                n_off, n_len = 0, 0
+            out.extend(
+                _SHADER_ENTRY_STRUCT.pack(
+                    e.key_hash,
+                    e.container_blake3,
+                    e.dxbc_digest,
+                    p_off,
+                    len(e.payload),
+                    e.payload_crc32,
+                    n_off,
+                    n_len,
+                    e.flags,
+                    0,
+                )
+            )
+
     out.extend(string_pool)
     out.extend(string_pad)
     out.extend(payload_blob)
@@ -296,7 +419,7 @@ def serialize_bundle(bundle: CompiledBundle) -> bytes:
 
 
 def parse_bundle(raw: bytes) -> CompiledBundle:
-    """Parse and validate `fireball_bundle.fbin` bytes back into a CompiledBundle."""
+    """Parse and validate v1 or v2 `fireball_bundle.fbin` bytes back into a CompiledBundle."""
     if len(raw) < FB_BUNDLE_HEADER_SIZE:
         raise ValueError(f"Bundle too small: {len(raw)} bytes")
 
@@ -317,10 +440,19 @@ def parse_bundle(raw: bytes) -> CompiledBundle:
 
     if magic != FB_BUNDLE_MAGIC:
         raise ValueError(f"Invalid bundle magic: 0x{magic:08X}")
-    if version != FB_BUNDLE_VERSION:
+
+    sh_count = 0
+    sh_off = 0
+    if version == FB_BUNDLE_VERSION:
+        if header_size != FB_BUNDLE_HEADER_SIZE:
+            raise ValueError(f"Unexpected v1 bundle header size: {header_size}")
+    elif version == FB_BUNDLE_VERSION_V2:
+        if header_size != FB_BUNDLE_HEADER_V2_SIZE or len(raw) < FB_BUNDLE_HEADER_V2_SIZE:
+            raise ValueError(f"Unexpected v2 bundle header size: {header_size}")
+        sh_count, _reserved1, sh_off = _HEADER_V2_EXT_STRUCT.unpack_from(raw, FB_BUNDLE_HEADER_SIZE)
+    else:
         raise ValueError(f"Unsupported bundle version: {version}")
-    if header_size != FB_BUNDLE_HEADER_SIZE:
-        raise ValueError(f"Unexpected bundle header size: {header_size}")
+
     if total_size != len(raw):
         raise ValueError(f"Bundle size mismatch: header={total_size}, actual={len(raw)}")
 
@@ -391,10 +523,47 @@ def parse_bundle(raw: bytes) -> CompiledBundle:
             raise ValueError(f"Plugin config hash mismatch for {mod_id}")
         cfg_entries.append(entry)
 
+    sh_entries: List[BundleShaderEntry] = []
+    if sh_count > 0:
+        if sh_off + sh_count * FB_SHADER_ENTRY_SIZE > len(raw):
+            raise ValueError("Shader override table out of bounds")
+        for i in range(sh_count):
+            pos = sh_off + i * FB_SHADER_ENTRY_SIZE
+            (
+                khash,
+                b3_bytes,
+                dxbc_bytes,
+                pay_off,
+                pay_sz,
+                crc,
+                n_off,
+                n_len,
+                eflags,
+                _res,
+            ) = _SHADER_ENTRY_STRUCT.unpack_from(raw, pos)
+            effect_name = read_str(n_off, n_len) if (n_len > 0 or n_off != 0) else ""
+            if pay_off + pay_sz > len(raw):
+                raise ValueError(f"Shader payload out of bounds for {b3_bytes.hex()}/{dxbc_bytes.hex()}")
+            payload = raw[pay_off : pay_off + pay_sz]
+            sh_entry = BundleShaderEntry(
+                container_blake3=b3_bytes,
+                dxbc_digest=dxbc_bytes,
+                payload=payload,
+                effect_name=effect_name,
+                flags=eflags,
+            )
+            if sh_entry.key_hash != khash:
+                raise ValueError(f"Shader key hash mismatch for {b3_bytes.hex()}/{dxbc_bytes.hex()}")
+            if sh_entry.payload_crc32 != crc:
+                raise ValueError(f"Shader CRC32 mismatch for {b3_bytes.hex()}/{dxbc_bytes.hex()}")
+            sh_entries.append(sh_entry)
+
     return CompiledBundle(
         dstorage_entries=ds_entries,
         overlay_entries=ov_entries,
         plugin_configs=cfg_entries,
+        shader_entries=sh_entries,
+        bundle_version=version,
     )
 
 
@@ -479,6 +648,8 @@ def build_patch_bundle(
     *,
     bundle_filename: str = "fireball_bundle.fbin",
     extra_overlays: Optional[Dict[str, bytes]] = None,
+    extra_shaders: Optional[Sequence[BundleShaderEntry]] = None,
+    mod_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     size_preserve: bool = False,
     tools_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -489,6 +660,7 @@ def build_patch_bundle(
     os.makedirs(out_dir, exist_ok=True)
     sources: List[VirtualModSource] = []
     manifests: List[ModManifest] = []
+    overrides_map = mod_overrides or {}
     try:
         for mp in mod_paths:
             src = open_mod_source(mp)
@@ -499,9 +671,45 @@ def build_patch_bundle(
 
         assets: Dict[Tuple[str, int], _AssetWorkState] = {}
         overlays: Dict[str, Tuple[bytes, str]] = {}  # norm_rel_path -> (bytes, provenance_source)
+        shaders: Dict[Tuple[bytes, bytes], Tuple[BundleShaderEntry, str]] = {}  # (b3, dxbc) -> (entry, source_tag)
         plugin_configs: Dict[str, Dict[str, Any]] = {}
         provenance_entries: List[Dict[str, Any]] = []
         mod_summaries: List[Dict[str, Any]] = []
+
+        # Field-level / overlay / shader multi-mod touch trackers for conflict reporting
+        field_touches: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        overlay_touches: Dict[str, List[Dict[str, Any]]] = {}
+        shader_touches: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+        def record_field_touch(
+            kind: str,
+            norm_arch: str,
+            off_hex: str,
+            field_loc: str,
+            target_label: str,
+            touch: Dict[str, Any],
+        ) -> None:
+            k = (kind, norm_arch, off_hex, field_loc)
+            bucket = field_touches.setdefault(
+                k,
+                {
+                    "kind": kind,
+                    "archive_path": norm_arch,
+                    "archive_offset": off_hex,
+                    "target": target_label,
+                    "field": field_loc,
+                    "touches": [],
+                },
+            )
+            bucket["touches"].append(touch)
+
+        def is_patch_enabled(mod_id: str, p: Dict[str, Any]) -> bool:
+            patch_id = str(p.get("id", ""))
+            mod_ov = overrides_map.get(mod_id, {})
+            patch_ov = mod_ov.get("patches", {}) if isinstance(mod_ov, dict) else {}
+            if patch_id in patch_ov:
+                return bool(patch_ov[patch_id])
+            return bool(p.get("enabled", True))
 
         def get_or_load_asset(archive_rel: str, off: int) -> _AssetWorkState:
             norm_arch = normalize_rel_path(archive_rel)
@@ -530,7 +738,7 @@ def build_patch_bundle(
 
             # 1. XML patches (merged in load order)
             for p in manifest.xml_patches:
-                if not p.get("enabled", True):
+                if not is_patch_enabled(manifest.mod_id, p):
                     continue
                 off = parse_int_hex(p["archive_offset"])
                 st = get_or_load_asset(str(p["archive"]), off)
@@ -551,11 +759,29 @@ def build_patch_bundle(
                 if manifest.mod_id not in st.contributing_mods:
                     st.contributing_mods.append(manifest.mod_id)
                 st.contributing_patches.append(str(p["id"]))
-                provenance_entries.extend(pr.to_dict() for pr in res.provenance)
+                off_hex = f"0x{off:08X}"
+                for pr in res.provenance:
+                    prd = pr.to_dict()
+                    provenance_entries.append(prd)
+                    record_field_touch(
+                        "xml",
+                        st.archive_path,
+                        off_hex,
+                        pr.location,
+                        str(p["target"]),
+                        {
+                            "mod_id": manifest.mod_id,
+                            "patch_id": str(p["id"]),
+                            "op": pr.op,
+                            "old_value": pr.old_value,
+                            "new_value": pr.new_value,
+                            "reason": pr.reason,
+                        },
+                    )
 
             # 2. KV patches (merged in load order)
             for p in manifest.kv_patches:
-                if not p.get("enabled", True):
+                if not is_patch_enabled(manifest.mod_id, p):
                     continue
                 off = parse_int_hex(p["archive_offset"])
                 st = get_or_load_asset(str(p["archive"]), off)
@@ -576,11 +802,29 @@ def build_patch_bundle(
                 if manifest.mod_id not in st.contributing_mods:
                     st.contributing_mods.append(manifest.mod_id)
                 st.contributing_patches.append(str(p["id"]))
-                provenance_entries.extend(pr.to_dict() for pr in res.provenance)
+                off_hex = f"0x{off:08X}"
+                for pr in res.provenance:
+                    prd = pr.to_dict()
+                    provenance_entries.append(prd)
+                    record_field_touch(
+                        "kv",
+                        st.archive_path,
+                        off_hex,
+                        pr.location,
+                        str(p["target"]),
+                        {
+                            "mod_id": manifest.mod_id,
+                            "patch_id": str(p["id"]),
+                            "op": pr.op,
+                            "old_value": pr.old_value,
+                            "new_value": pr.new_value,
+                            "reason": pr.reason,
+                        },
+                    )
 
             # 3. Binary PSO patches (merged in load order)
             for p in manifest.pso_patches:
-                if not p.get("enabled", True):
+                if not is_patch_enabled(manifest.mod_id, p):
                     continue
                 off = parse_int_hex(p["archive_offset"])
                 st = get_or_load_asset(str(p["archive"]), off)
@@ -603,41 +847,203 @@ def build_patch_bundle(
                 if manifest.mod_id not in st.contributing_mods:
                     st.contributing_mods.append(manifest.mod_id)
                 st.contributing_patches.append(str(p["id"]))
+                off_hex = f"0x{off:08X}"
                 for d in res.diffs:
+                    loc = f"{d.struct_hash}[{d.instance_index}]{d.member_offset} ({d.member_name})"
+                    field_key = f"{d.struct_hash}[{d.instance_index}]{d.member_offset}"
                     provenance_entries.append(
                         {
                             "mod_id": manifest.mod_id,
                             "patch_id": str(p["id"]),
                             "target": str(p["target"]),
-                            "location": f"{d.struct_hash}[{d.instance_index}]{d.member_offset} ({d.member_name})",
+                            "location": loc,
                             "op": f"pso.{d.field_type}",
                             "old_value": d.old_value,
                             "new_value": d.new_value,
                             "reason": d.reason,
                         }
                     )
+                    record_field_touch(
+                        "pso",
+                        st.archive_path,
+                        off_hex,
+                        field_key,
+                        str(p["target"]),
+                        {
+                            "mod_id": manifest.mod_id,
+                            "patch_id": str(p["id"]),
+                            "op": f"pso.{d.field_type}",
+                            "member_name": d.member_name,
+                            "old_value": d.old_value,
+                            "new_value": d.new_value,
+                            "reason": d.reason,
+                        },
+                    )
 
             # 4. Loose-file overlays from `overlays/` directory or `[[overlays]]` in mod.toml
             for rel_file in src.list_files():
                 if rel_file.startswith("overlays/"):
                     target_rel = normalize_rel_path(rel_file[len("overlays/") :])
-                    overlays[target_rel] = (src.read_bytes(rel_file), f"{manifest.mod_id}:{rel_file}")
+                    raw_ov = src.read_bytes(rel_file)
+                    src_tag = f"{manifest.mod_id}:{rel_file}"
+                    overlays[target_rel] = (raw_ov, src_tag)
+                    overlay_touches.setdefault(target_rel, []).append(
+                        {
+                            "mod_id": manifest.mod_id,
+                            "source": src_tag,
+                            "size_bytes": len(raw_ov),
+                            "crc32": f"0x{binascii.crc32(raw_ov) & 0xFFFFFFFF:08X}",
+                        }
+                    )
             for ov_spec in manifest.raw.get("overlays", []):
                 target_rel = normalize_rel_path(str(ov_spec["target"]))
                 src_rel = str(ov_spec["source"])
-                overlays[target_rel] = (src.read_bytes(src_rel), f"{manifest.mod_id}:{src_rel}")
+                raw_ov = src.read_bytes(src_rel)
+                src_tag = f"{manifest.mod_id}:{src_rel}"
+                overlays[target_rel] = (raw_ov, src_tag)
+                overlay_touches.setdefault(target_rel, []).append(
+                    {
+                        "mod_id": manifest.mod_id,
+                        "source": src_tag,
+                        "size_bytes": len(raw_ov),
+                        "crc32": f"0x{binascii.crc32(raw_ov) & 0xFFFFFFFF:08X}",
+                    }
+                )
 
-            # 5. Plugin config JSONs
+            # 5. Shader DXIL overrides (`[[patches.shaders]]` or `[[shaders]]`)
+            for sh_spec in manifest.shader_patches:
+                if not is_patch_enabled(manifest.mod_id, sh_spec):
+                    continue
+                b3 = parse_hex_bytes(str(sh_spec["container_blake3"]), 32, "container_blake3")
+                dxbc = parse_hex_bytes(str(sh_spec["dxbc_digest"]), 16, "dxbc_digest")
+                dxil_rel = str(sh_spec.get("dxil") or sh_spec.get("source") or "")
+                if not dxil_rel:
+                    raise ValueError(f"Shader override in '{manifest.mod_id}' missing 'dxil' or 'source' path")
+                dxil_bytes = src.read_bytes(dxil_rel)
+                eff_name = str(sh_spec.get("effect_name", ""))
+                sh_flags = int(sh_spec.get("flags", 0))
+                sh_entry = BundleShaderEntry(
+                    container_blake3=b3,
+                    dxbc_digest=dxbc,
+                    payload=dxil_bytes,
+                    effect_name=eff_name,
+                    flags=sh_flags,
+                )
+                src_tag = f"{manifest.mod_id}:{dxil_rel}"
+                shaders[(b3, dxbc)] = (sh_entry, src_tag)
+                shader_touches.setdefault((b3.hex(), dxbc.hex()), []).append(
+                    {
+                        "mod_id": manifest.mod_id,
+                        "patch_id": str(sh_spec.get("id", dxil_rel)),
+                        "effect_name": eff_name,
+                        "source": src_tag,
+                        "size_bytes": len(dxil_bytes),
+                        "crc32": f"0x{sh_entry.payload_crc32:08X}",
+                    }
+                )
+
+            # 6. Plugin config JSONs (plus optional profile-level overrides)
             for plg in manifest.plugins:
                 cfg = plg.get("config")
                 if isinstance(cfg, dict) and cfg:
                     merged_cfg = plugin_configs.setdefault(manifest.mod_id, {})
                     merged_cfg.update(cfg)
+            mod_ov = overrides_map.get(manifest.mod_id, {})
+            if isinstance(mod_ov, dict):
+                cfg_ov = mod_ov.get("plugin_config")
+                if isinstance(cfg_ov, dict) and cfg_ov:
+                    merged_cfg = plugin_configs.setdefault(manifest.mod_id, {})
+                    merged_cfg.update(cfg_ov)
 
         if extra_overlays:
             for target_rel, raw_data in extra_overlays.items():
                 norm_rel = normalize_rel_path(target_rel)
                 overlays[norm_rel] = (raw_data, "cli:--overlay")
+                overlay_touches.setdefault(norm_rel, []).append(
+                    {
+                        "mod_id": "cli:--overlay",
+                        "source": "cli:--overlay",
+                        "size_bytes": len(raw_data),
+                        "crc32": f"0x{binascii.crc32(raw_data) & 0xFFFFFFFF:08X}",
+                    }
+                )
+
+        if extra_shaders:
+            for sh_e in extra_shaders:
+                sk = (sh_e.container_blake3, sh_e.dxbc_digest)
+                shaders[sk] = (sh_e, "cli:--shader")
+                shader_touches.setdefault((sh_e.container_blake3.hex(), sh_e.dxbc_digest.hex()), []).append(
+                    {
+                        "mod_id": "cli:--shader",
+                        "patch_id": sh_e.effect_name or "extra_shader",
+                        "effect_name": sh_e.effect_name,
+                        "source": "cli:--shader",
+                        "size_bytes": len(sh_e.payload),
+                        "crc32": f"0x{sh_e.payload_crc32:08X}",
+                    }
+                )
+
+        # Build deterministic field-level conflict / override summary
+        conflicts: List[Dict[str, Any]] = []
+        for (_kind, _arch, _off_hex, _floc), bucket in sorted(field_touches.items()):
+            touches = bucket["touches"]
+            distinct_mods: List[str] = []
+            for t in touches:
+                if t["mod_id"] not in distinct_mods:
+                    distinct_mods.append(t["mod_id"])
+            if len(distinct_mods) > 1:
+                winner = touches[-1]
+                conflicts.append(
+                    {
+                        "kind": bucket["kind"],
+                        "archive_path": bucket["archive_path"],
+                        "archive_offset": bucket["archive_offset"],
+                        "target": bucket["target"],
+                        "field": bucket["field"],
+                        "winner_mod": winner["mod_id"],
+                        "overridden_mods": [m for m in distinct_mods if m != winner["mod_id"]],
+                        "winning_value": winner["new_value"],
+                        "touches": touches,
+                    }
+                )
+
+        for rel_path, touches in sorted(overlay_touches.items()):
+            distinct_mods = []
+            for t in touches:
+                if t["mod_id"] not in distinct_mods:
+                    distinct_mods.append(t["mod_id"])
+            if len(distinct_mods) > 1:
+                winner = touches[-1]
+                conflicts.append(
+                    {
+                        "kind": "overlay",
+                        "target": rel_path,
+                        "field": rel_path,
+                        "winner_mod": winner["mod_id"],
+                        "overridden_mods": [m for m in distinct_mods if m != winner["mod_id"]],
+                        "winning_value": winner["crc32"],
+                        "touches": touches,
+                    }
+                )
+
+        for (b3_hex, dxbc_hex), touches in sorted(shader_touches.items()):
+            distinct_mods = []
+            for t in touches:
+                if t["mod_id"] not in distinct_mods:
+                    distinct_mods.append(t["mod_id"])
+            if len(distinct_mods) > 1:
+                winner = touches[-1]
+                conflicts.append(
+                    {
+                        "kind": "shader",
+                        "target": f"{b3_hex}/{dxbc_hex}",
+                        "field": winner.get("effect_name") or f"{b3_hex[:16]}.../{dxbc_hex}",
+                        "winner_mod": winner["mod_id"],
+                        "overridden_mods": [m for m in distinct_mods if m != winner["mod_id"]],
+                        "winning_value": winner["crc32"],
+                        "touches": touches,
+                    }
+                )
 
         # Build DirectStorage entries: full-asset + changed/explicit per-64KiB-page slices
         ds_entries: List[BundleDStorageEntry] = []
@@ -746,10 +1152,26 @@ def build_patch_bundle(
             for mid, cfg_dict in sorted(plugin_configs.items())
         ]
 
+        sh_entries: List[BundleShaderEntry] = []
+        sh_index_report: List[Dict[str, Any]] = []
+        for (_b3, _dxbc), (sh_e, source_tag) in sorted(shaders.items()):
+            sh_entries.append(sh_e)
+            sh_index_report.append(
+                {
+                    "container_blake3": sh_e.container_blake3.hex(),
+                    "dxbc_digest": sh_e.dxbc_digest.hex(),
+                    "effect_name": sh_e.effect_name,
+                    "size_bytes": len(sh_e.payload),
+                    "crc32": f"0x{sh_e.payload_crc32:08X}",
+                    "source": source_tag,
+                }
+            )
+
         compiled = CompiledBundle(
             dstorage_entries=ds_entries,
             overlay_entries=ov_entries,
             plugin_configs=cfg_entries,
+            shader_entries=sh_entries,
         )
         fbin_bytes = serialize_bundle(compiled)
         # Round-trip self-check before writing to disk
@@ -757,6 +1179,7 @@ def build_patch_bundle(
         assert len(_parsed_check.dstorage_entries) == len(ds_entries)
         assert len(_parsed_check.overlay_entries) == len(ov_entries)
         assert len(_parsed_check.plugin_configs) == len(cfg_entries)
+        assert len(_parsed_check.shader_entries) == len(sh_entries)
 
         bundle_path = os.path.join(out_dir, bundle_filename)
         with open(bundle_path, "wb") as wf:
@@ -764,7 +1187,7 @@ def build_patch_bundle(
 
         prov_report = {
             "bundle_file": os.path.abspath(bundle_path),
-            "bundle_version": FB_BUNDLE_VERSION,
+            "bundle_version": _parsed_check.bundle_version,
             "bundle_size_bytes": len(fbin_bytes),
             "size_preserve": size_preserve,
             "size_preserve_reclaimed_bytes": total_reclaimed_bytes,
@@ -773,10 +1196,14 @@ def build_patch_bundle(
             "dstorage_entry_count": len(ds_entries),
             "overlay_entry_count": len(ov_entries),
             "plugin_config_count": len(cfg_entries),
+            "shader_entry_count": len(sh_entries),
             "dstorage_entries": ds_index_report,
             "overlay_entries": ov_index_report,
             "plugin_configs": [c.mod_id for c in cfg_entries],
+            "shader_entries": sh_index_report,
             "total_field_changes": len(provenance_entries),
+            "conflict_count": len(conflicts),
+            "conflicts": conflicts,
             "provenance": provenance_entries,
         }
         prov_path = os.path.join(out_dir, "fireball_bundle_provenance.json")
@@ -841,15 +1268,28 @@ def inspect_bundle_file(bundle_path: str) -> Dict[str, Any]:
         }
         for e in parsed.plugin_configs
     ]
+    sh_list = [
+        {
+            "container_blake3": e.container_blake3.hex(),
+            "dxbc_digest": e.dxbc_digest.hex(),
+            "effect_name": e.effect_name,
+            "payload_size": len(e.payload),
+            "payload_crc32": f"0x{e.payload_crc32:08X}",
+            "flags": e.flags,
+        }
+        for e in parsed.shader_entries
+    ]
     return {
         "bundle_file": os.path.abspath(bundle_path),
-        "bundle_version": FB_BUNDLE_VERSION,
+        "bundle_version": parsed.bundle_version,
         "bundle_size_bytes": len(raw),
         "dstorage_entry_count": len(ds_list),
         "overlay_entry_count": len(ov_list),
         "plugin_config_count": len(cfg_list),
+        "shader_entry_count": len(sh_list),
         "all_fit_fixed_dst": all(d["fits_fixed_dst"] for d in ds_list),
         "dstorage_entries": ds_list,
         "overlay_entries": ov_list,
         "plugin_configs": cfg_list,
+        "shader_entries": sh_list,
     }

@@ -177,6 +177,13 @@ static uint64_t local_ds_key_hash(const char* path, uint64_t file_offset, uint32
     return local_fnv1a_64(buf, plen + 13);
 }
 
+static uint64_t local_shader_key_hash(const uint8_t b3[32], const uint8_t dxbc[16]) {
+    uint8_t key[48];
+    memcpy(key, b3, 32u);
+    memcpy(key + 32u, dxbc, 16u);
+    return local_fnv1a_64(key, sizeof(key));
+}
+
 static uint32_t local_crc32(const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
     uint32_t crc = 0xFFFFFFFFu;
@@ -247,8 +254,24 @@ static const char SYNTH_CFG_JSON[] =
     "{\"director_symbol\":\"rage::camGameplayDirector::s_Instance\","
     "\"first_person_mode\":2,\"hold_guard_enabled\":true,\"hotkey_vkey\":86,"
     "\"third_person_mode\":0,\"view_mode_field_offset\":0}";
+static const uint8_t SYNTH_SHADER_B3[32] = {
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47
+};
+static const uint8_t SYNTH_SHADER_DXBC[16] = {
+    0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+    0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90
+};
+static const char SYNTH_SHADER_NAME[] = "fx_fpv_visor_ps";
+static const uint8_t SYNTH_SHADER_DXIL[24] = {
+    'D','X','B','C', 0x01, 0x02, 0x03, 0x04,
+    'D','X','I','L', 0x55, 0xAA, 0x11, 0x22,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE
+};
 
-static int write_synthetic_bundle(const wchar_t* bundle_path) {
+static int write_synthetic_bundle_ex(const wchar_t* bundle_path, int include_v2_shader) {
     /*
      * 4 DirectStorage entries:
      *   0: ("common.rpf", 0x0003B000, len(XML)+7) -> SYNTH_XML (simulates shrunk XML)
@@ -259,54 +282,80 @@ static int write_synthetic_bundle(const wchar_t* bundle_path) {
      *   0: "data/fireball_overlay_test.txt" -> SYNTH_OVERLAY
      * 1 Plugin config entry:
      *   0: "community.fpv_unlocker" -> SYNTH_CFG_JSON
+     * Optional (v2) 1 Shader DXIL override entry:
+     *   0: (SYNTH_SHADER_B3, SYNTH_SHADER_DXBC) -> SYNTH_SHADER_DXIL
      */
     const char* s_common = "common.rpf";
     const char* s_data = "data.rpf";
     const char* s_ov = "data/fireball_overlay_test.txt";
     const char* s_mod = "community.fpv_unlocker";
 
-    size_t ds_off = sizeof(fb_bundle_header_t);
+    size_t hdr_sz = include_v2_shader ? sizeof(fb_bundle_header_v2_t) : sizeof(fb_bundle_header_t);
+    size_t ds_off = hdr_sz;
     size_t ov_off = ds_off + 4u * sizeof(fb_bundle_dstorage_entry_t);
     size_t cfg_off = ov_off + 1u * sizeof(fb_bundle_overlay_entry_t);
-    size_t str_off = cfg_off + 1u * sizeof(fb_bundle_plugin_cfg_entry_t);
+    size_t sh_off = cfg_off + 1u * sizeof(fb_bundle_plugin_cfg_entry_t);
+    size_t str_off = sh_off + (include_v2_shader ? sizeof(fb_bundle_shader_entry_t) : 0u);
 
     size_t off_s_common = str_off;
     size_t off_s_data = off_s_common + strlen(s_common) + 1u;
     size_t off_s_ov = off_s_data + strlen(s_data) + 1u;
     size_t off_s_mod = off_s_ov + strlen(s_ov) + 1u;
     size_t off_s_cfg = off_s_mod + strlen(s_mod) + 1u;
-    size_t pay_start = align16_sz(off_s_cfg + strlen(SYNTH_CFG_JSON) + 1u);
+    size_t off_s_shname = off_s_cfg + strlen(SYNTH_CFG_JSON) + 1u;
+    size_t str_end = include_v2_shader ? (off_s_shname + strlen(SYNTH_SHADER_NAME) + 1u) : off_s_shname;
+    size_t pay_start = align16_sz(str_end);
 
     size_t xml_len = strlen(SYNTH_XML);
     size_t kv_len = strlen(SYNTH_KV);
     size_t pso_len = sizeof(SYNTH_PSO);
     size_t ov_len = strlen(SYNTH_OVERLAY);
+    size_t sh_len = sizeof(SYNTH_SHADER_DXIL);
 
     size_t off_p_xml0 = pay_start;
     size_t off_p_xml1 = off_p_xml0 + align16_sz(xml_len);
     size_t off_p_kv = off_p_xml1 + align16_sz(xml_len);
     size_t off_p_pso = off_p_kv + align16_sz(kv_len);
     size_t off_p_ov = off_p_pso + align16_sz(pso_len);
-    size_t total_size = off_p_ov + align16_sz(ov_len);
+    size_t off_p_sh = off_p_ov + align16_sz(ov_len);
+    size_t total_size = include_v2_shader ? (off_p_sh + align16_sz(sh_len)) : off_p_sh;
 
     uint8_t* buf = (uint8_t*)calloc(1, total_size);
     if (!buf) {
         return 0;
     }
 
-    fb_bundle_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic = FB_BUNDLE_MAGIC;
-    hdr.version = FB_BUNDLE_VERSION;
-    hdr.header_size = FB_BUNDLE_HEADER_SIZE;
-    hdr.dstorage_count = 4u;
-    hdr.overlay_count = 1u;
-    hdr.plugin_config_count = 1u;
-    hdr.dstorage_table_off = (uint64_t)ds_off;
-    hdr.overlay_table_off = (uint64_t)ov_off;
-    hdr.plugin_cfg_table_off = (uint64_t)cfg_off;
-    hdr.total_file_size = (uint64_t)total_size;
-    memcpy(buf, &hdr, sizeof(hdr));
+    if (include_v2_shader) {
+        fb_bundle_header_v2_t hdr2;
+        memset(&hdr2, 0, sizeof(hdr2));
+        hdr2.v1.magic = FB_BUNDLE_MAGIC;
+        hdr2.v1.version = FB_BUNDLE_VERSION_V2;
+        hdr2.v1.header_size = FB_BUNDLE_HEADER_V2_SIZE;
+        hdr2.v1.dstorage_count = 4u;
+        hdr2.v1.overlay_count = 1u;
+        hdr2.v1.plugin_config_count = 1u;
+        hdr2.v1.dstorage_table_off = (uint64_t)ds_off;
+        hdr2.v1.overlay_table_off = (uint64_t)ov_off;
+        hdr2.v1.plugin_cfg_table_off = (uint64_t)cfg_off;
+        hdr2.v1.total_file_size = (uint64_t)total_size;
+        hdr2.shader_count = 1u;
+        hdr2.shader_table_off = (uint64_t)sh_off;
+        memcpy(buf, &hdr2, sizeof(hdr2));
+    } else {
+        fb_bundle_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic = FB_BUNDLE_MAGIC;
+        hdr.version = FB_BUNDLE_VERSION;
+        hdr.header_size = FB_BUNDLE_HEADER_SIZE;
+        hdr.dstorage_count = 4u;
+        hdr.overlay_count = 1u;
+        hdr.plugin_config_count = 1u;
+        hdr.dstorage_table_off = (uint64_t)ds_off;
+        hdr.overlay_table_off = (uint64_t)ov_off;
+        hdr.plugin_cfg_table_off = (uint64_t)cfg_off;
+        hdr.total_file_size = (uint64_t)total_size;
+        memcpy(buf, &hdr, sizeof(hdr));
+    }
 
     fb_bundle_dstorage_entry_t ds[4];
     memset(ds, 0, sizeof(ds));
@@ -372,21 +421,45 @@ static int write_synthetic_bundle(const wchar_t* bundle_path) {
     cfg.json_len = (uint32_t)strlen(SYNTH_CFG_JSON);
     memcpy(buf + cfg_off, &cfg, sizeof(cfg));
 
+    if (include_v2_shader) {
+        fb_bundle_shader_entry_t sh;
+        memset(&sh, 0, sizeof(sh));
+        sh.key_hash = local_shader_key_hash(SYNTH_SHADER_B3, SYNTH_SHADER_DXBC);
+        memcpy(sh.container_blake3, SYNTH_SHADER_B3, 32u);
+        memcpy(sh.dxbc_digest, SYNTH_SHADER_DXBC, 16u);
+        sh.payload_offset = (uint64_t)off_p_sh;
+        sh.payload_size = (uint32_t)sh_len;
+        sh.payload_crc32 = local_crc32(SYNTH_SHADER_DXIL, sh_len);
+        sh.name_offset = (uint32_t)off_s_shname;
+        sh.name_len = (uint32_t)strlen(SYNTH_SHADER_NAME);
+        memcpy(buf + sh_off, &sh, sizeof(sh));
+    }
+
     memcpy(buf + off_s_common, s_common, strlen(s_common) + 1u);
     memcpy(buf + off_s_data, s_data, strlen(s_data) + 1u);
     memcpy(buf + off_s_ov, s_ov, strlen(s_ov) + 1u);
     memcpy(buf + off_s_mod, s_mod, strlen(s_mod) + 1u);
     memcpy(buf + off_s_cfg, SYNTH_CFG_JSON, strlen(SYNTH_CFG_JSON) + 1u);
+    if (include_v2_shader) {
+        memcpy(buf + off_s_shname, SYNTH_SHADER_NAME, strlen(SYNTH_SHADER_NAME) + 1u);
+    }
 
     memcpy(buf + off_p_xml0, SYNTH_XML, xml_len);
     memcpy(buf + off_p_xml1, SYNTH_XML, xml_len);
     memcpy(buf + off_p_kv, SYNTH_KV, kv_len);
     memcpy(buf + off_p_pso, SYNTH_PSO, pso_len);
     memcpy(buf + off_p_ov, SYNTH_OVERLAY, ov_len);
+    if (include_v2_shader) {
+        memcpy(buf + off_p_sh, SYNTH_SHADER_DXIL, sh_len);
+    }
 
     int ok = write_entire_file(bundle_path, buf, total_size);
     free(buf);
     return ok;
+}
+
+static int write_synthetic_bundle(const wchar_t* bundle_path) {
+    return write_synthetic_bundle_ex(bundle_path, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -534,6 +607,36 @@ static void verify_synthetic_bundle_io(const fb_modcore_callbacks_v1_t* cb) {
         CHECK(memcmp(part2, SYNTH_OVERLAY + 13, (size_t)r2) == 0);
         desc.close(desc.user_ctx);
     }
+
+    /* Shader DXIL override lookup (`on_shader_load`) */
+    const void* dxil_ptr = NULL;
+    size_t dxil_sz = 0u;
+    CHECK(cb->on_shader_load(SYNTH_SHADER_B3, SYNTH_SHADER_DXBC, "fx_fpv_visor_ps", &dxil_ptr, &dxil_sz) == 1);
+    CHECK(dxil_ptr != NULL && dxil_sz == sizeof(SYNTH_SHADER_DXIL));
+    if (dxil_ptr && dxil_sz == sizeof(SYNTH_SHADER_DXIL)) {
+        CHECK(memcmp(dxil_ptr, SYNTH_SHADER_DXIL, sizeof(SYNTH_SHADER_DXIL)) == 0);
+    }
+    /* Second hit succeeds without duplicating first-hit log */
+    dxil_ptr = NULL;
+    dxil_sz = 0u;
+    CHECK(cb->on_shader_load(SYNTH_SHADER_B3, SYNTH_SHADER_DXBC, NULL, &dxil_ptr, &dxil_sz) == 1);
+    CHECK(dxil_ptr != NULL && dxil_sz == sizeof(SYNTH_SHADER_DXIL));
+
+    /* Miss on wrong digest & wrong container hash */
+    uint8_t wrong_dxbc[16];
+    memcpy(wrong_dxbc, SYNTH_SHADER_DXBC, sizeof(wrong_dxbc));
+    wrong_dxbc[0] ^= 0xFFu;
+    CHECK(cb->on_shader_load(SYNTH_SHADER_B3, wrong_dxbc, "miss_dxbc", &dxil_ptr, &dxil_sz) == 0);
+    CHECK(dxil_ptr == NULL && dxil_sz == 0u);
+
+    uint8_t wrong_b3[32];
+    memcpy(wrong_b3, SYNTH_SHADER_B3, sizeof(wrong_b3));
+    wrong_b3[31] ^= 0x01u;
+    CHECK(cb->on_shader_load(wrong_b3, SYNTH_SHADER_DXBC, "miss_b3", &dxil_ptr, &dxil_sz) == 0);
+    CHECK(dxil_ptr == NULL && dxil_sz == 0u);
+
+    /* Null pointer safety */
+    CHECK(cb->on_shader_load(NULL, SYNTH_SHADER_DXBC, NULL, &dxil_ptr, &dxil_sz) == 0);
 }
 
 static void verify_real_bundle_against_expect_dir(const fb_modcore_callbacks_v1_t* cb, const wchar_t* expect_dir) {
@@ -777,6 +880,10 @@ static void test_scenario_a_full_host(
     CHECK(engine_read_u32(DIRECTOR_VA) == 0u);
     CHECK(logs_contain(FB_LOG_INFO, "Telemetry summary:", "dstorage_hits="));
     CHECK(logs_contain(FB_LOG_INFO, "First DirectStorage hit:", NULL));
+    if (!expect_dir && !size_preserve_check) {
+        CHECK(logs_contain(FB_LOG_INFO, "Telemetry summary:", "shader_calls=5 shader_hits=2"));
+        CHECK(logs_contain(FB_LOG_INFO, "First shader override hit:", "fx_fpv_visor_ps"));
+    }
 }
 
 static void test_scenario_b_tier0_only(fb_attach_host_fn attach_fn, const wchar_t* mods_dir) {
@@ -970,6 +1077,7 @@ static void test_scenario_c_console_and_pipe(fb_attach_host_fn attach_fn, const 
 
         CHECK(send_pipe_cmd(pipe, "stats", resp, sizeof(resp), &rc) && rc == FB_OK);
         CHECK(strstr(resp, "input_events=") != NULL);
+        CHECK(strstr(resp, "Shaders:") != NULL);
 
         CHECK(send_pipe_cmd(pipe, "set community.fpv_unlocker hold_guard_enabled false", resp, sizeof(resp), &rc) && rc == FB_OK);
         CHECK(send_pipe_cmd(pipe, "get community.fpv_unlocker hold_guard_enabled", resp, sizeof(resp), &rc) && rc == FB_OK);
@@ -989,6 +1097,47 @@ static void test_scenario_c_console_and_pipe(fb_attach_host_fn attach_fn, const 
 
     cb.on_shutdown();
     SetEnvironmentVariableW(L"FIREBALL_CONSOLE_PIPE", NULL);
+}
+
+static void test_v1_bundle_backward_compat(fb_attach_host_fn attach_fn, const wchar_t* exe_dir) {
+    printf("\n[Scenario D] Legacy v1 Bundle Backward Compatibility (64-byte header)\n");
+    reset_logs();
+    wchar_t v1_dir[MAX_PATH * 2];
+    wchar_t v1_bundle[MAX_PATH * 2];
+    swprintf(v1_dir, sizeof(v1_dir) / sizeof(v1_dir[0]), L"%ls\\mock_mods_v1_compat", exe_dir);
+    CreateDirectoryW(v1_dir, NULL);
+    swprintf(v1_bundle, sizeof(v1_bundle) / sizeof(v1_bundle[0]), L"%ls\\fireball_bundle.fbin", v1_dir);
+    CHECK(write_synthetic_bundle_ex(v1_bundle, 0) != 0);
+
+    fb_host_api_v1_t api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api);
+    api.abi_version = FB_HOST_ABI_VERSION;
+    api.host_name = "VIctory-HLE-Mock-V1Compat";
+    api.host_version = "0.1.0-native";
+    api.game_root_dir = L"D:\\Games\\GTA6";
+    api.mods_root_dir = v1_dir;
+    api.capabilities = FB_CAP_IO_VIRTUAL | FB_CAP_DSTORAGE_INTERCEPT | FB_CAP_D3D12_SHADERS;
+    api.log = host_log_cb;
+
+    fb_modcore_callbacks_v1_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.struct_size = (uint32_t)sizeof(cb);
+    CHECK(attach_fn(&api, &cb) == FB_OK);
+    CHECK(logs_contain(FB_LOG_INFO, "Loaded fireball_bundle.fbin (v1,", "0 shader overrides"));
+
+    /* DirectStorage still hits on v1 bundle */
+    verify_ds_hit_bytes(&cb, L"data.rpf", 0x006C6000ull, (uint32_t)sizeof(SYNTH_PSO),
+                        SYNTH_PSO, sizeof(SYNTH_PSO), (uint32_t)sizeof(SYNTH_PSO), 0);
+
+    /* Shader lookup misses cleanly on v1 bundle */
+    const void* dxil_ptr = (const void*)0x1;
+    size_t dxil_sz = 99u;
+    CHECK(cb.on_shader_load(SYNTH_SHADER_B3, SYNTH_SHADER_DXBC, "fx_fpv_visor_ps", &dxil_ptr, &dxil_sz) == 0);
+    CHECK(dxil_ptr == NULL && dxil_sz == 0u);
+
+    cb.on_shutdown();
+    CHECK(logs_contain(FB_LOG_INFO, "Telemetry summary:", "shader_calls=1 shader_hits=0"));
 }
 
 static void get_exe_dir(wchar_t* out_dir, size_t cap) {
@@ -1066,6 +1215,7 @@ int wmain(int argc, wchar_t** argv) {
         test_scenario_b_tier0_only(attach_fn, mods_dir);
         if (!expect_dir_arg && !size_preserve_check) {
             test_scenario_c_console_and_pipe(attach_fn, mods_dir);
+            test_v1_bundle_backward_compat(attach_fn, exe_dir);
         }
     }
 

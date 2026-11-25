@@ -52,6 +52,7 @@ typedef struct fb_core_state {
     /* Per-entry first-hit flags (log once per target without spamming hot loops) */
     volatile LONG*        ds_first_hit;
     volatile LONG*        ov_first_hit;
+    volatile LONG*        shader_first_hit;
 
     /* Lock-free atomic live boot telemetry counters */
     volatile LONG64       dstorage_calls;
@@ -59,6 +60,8 @@ typedef struct fb_core_state {
     volatile LONG64       dstorage_buf_too_small;
     volatile LONG64       file_open_calls;
     volatile LONG64       file_open_hits;
+    volatile LONG64       shader_calls;
+    volatile LONG64       shader_hits;
     volatile LONG64       input_events;
     volatile LONG64       input_consumed;
     volatile LONG64       frames_seen;
@@ -284,6 +287,18 @@ static int fb_cb_on_dstorage_read(const fb_dstorage_req_view_t* req) {
     return 1;
 }
 
+static void fb_format_hex_bytes(const uint8_t* bytes, size_t count, char* out, size_t cap) {
+    static const char k_hex[] = "0123456789abcdef";
+    size_t pos = 0u;
+    for (size_t i = 0; i < count && pos + 2u < cap; ++i) {
+        out[pos++] = k_hex[(bytes[i] >> 4) & 0xFu];
+        out[pos++] = k_hex[bytes[i] & 0xFu];
+    }
+    if (cap > 0u) {
+        out[pos] = '\0';
+    }
+}
+
 static int fb_cb_on_shader_load(
     const uint8_t container_blake3[32],
     const uint8_t dxbc_digest[16],
@@ -291,12 +306,71 @@ static int fb_cb_on_shader_load(
     const void**  out_dxil,
     size_t*       out_size)
 {
-    (void)container_blake3;
-    (void)dxbc_digest;
-    (void)effect_name_or_null;
-    (void)out_dxil;
-    (void)out_size;
-    return 0;
+    InterlockedIncrement64(&g_core.shader_calls);
+    if (out_dxil) {
+        *out_dxil = NULL;
+    }
+    if (out_size) {
+        *out_size = 0u;
+    }
+    if (!container_blake3 || !dxbc_digest || !out_dxil || !out_size) {
+        return 0;
+    }
+
+    AcquireSRWLockShared(&g_core.lock);
+    if (!g_core.attached || !g_core.has_bundle || g_core.bundle.shader_count == 0u) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    const fb_bundle_shader_entry_t* entry = fb_bundle_find_shader(
+        &g_core.bundle,
+        container_blake3,
+        dxbc_digest);
+    if (!entry) {
+        ReleaseSRWLockShared(&g_core.lock);
+        return 0;
+    }
+
+    *out_dxil = g_core.bundle.raw_data + entry->payload_offset;
+    *out_size = (size_t)entry->payload_size;
+
+    InterlockedIncrement64(&g_core.shader_hits);
+    ptrdiff_t idx = entry - g_core.bundle.shader_entries;
+    int log_first = 0;
+    uint32_t pay_sz = entry->payload_size;
+    char logged_name[128];
+    logged_name[0] = '\0';
+    if (g_core.shader_first_hit && idx >= 0 && (uint32_t)idx < g_core.bundle.shader_count) {
+        if (InterlockedCompareExchange(&g_core.shader_first_hit[idx], 1, 0) == 0) {
+            log_first = 1;
+            if (effect_name_or_null && effect_name_or_null[0] != '\0') {
+                snprintf(logged_name, sizeof(logged_name), "%s", effect_name_or_null);
+            } else if (entry->name_len > 0u) {
+                const char* ename = (const char*)(g_core.bundle.raw_data + entry->name_offset);
+                snprintf(logged_name, sizeof(logged_name), "%.*s", (int)entry->name_len, ename);
+            }
+        }
+    }
+
+    ReleaseSRWLockShared(&g_core.lock);
+    if (log_first) {
+        char b3_hex[17];
+        char dx_hex[33];
+        fb_format_hex_bytes(container_blake3, 8u, b3_hex, sizeof(b3_hex));
+        fb_format_hex_bytes(dxbc_digest, 16u, dx_hex, sizeof(dx_hex));
+        char msg[512];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "First shader override hit: blake3=%s... dxbc=%s effect='%s' (%u B DXIL)",
+            b3_hex,
+            dx_hex,
+            logged_name[0] ? logged_name : "<unnamed>",
+            pay_sz);
+        core_log(FB_LOG_INFO, "fireball-core", msg);
+    }
+    return 1;
 }
 
 static int fb_cb_on_bvh_rehydrate(uint64_t archetype_h64, uint64_t drawable_h64) {
@@ -374,8 +448,10 @@ static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
 static void fb_free_first_hit_arrays(void) {
     free((void*)g_core.ds_first_hit);
     free((void*)g_core.ov_first_hit);
+    free((void*)g_core.shader_first_hit);
     g_core.ds_first_hit = NULL;
     g_core.ov_first_hit = NULL;
+    g_core.shader_first_hit = NULL;
 }
 
 static void fb_reset_telemetry(void) {
@@ -384,6 +460,8 @@ static void fb_reset_telemetry(void) {
     g_core.dstorage_buf_too_small = 0;
     g_core.file_open_calls = 0;
     g_core.file_open_hits = 0;
+    g_core.shader_calls = 0;
+    g_core.shader_hits = 0;
     g_core.input_events = 0;
     g_core.input_consumed = 0;
     g_core.frames_seen = 0;
@@ -416,12 +494,15 @@ static void fb_cb_on_shutdown(void) {
             msg,
             sizeof(msg),
             "Telemetry summary: dstorage_calls=%lld dstorage_hits=%lld dstorage_buf_too_small=%lld | "
-            "file_open_calls=%lld file_open_hits=%lld | frames_seen=%lld | input_events=%lld input_consumed=%lld",
+            "file_open_calls=%lld file_open_hits=%lld | shader_calls=%lld shader_hits=%lld | "
+            "frames_seen=%lld | input_events=%lld input_consumed=%lld",
             (long long)g_core.dstorage_calls,
             (long long)g_core.dstorage_hits,
             (long long)g_core.dstorage_buf_too_small,
             (long long)g_core.file_open_calls,
             (long long)g_core.file_open_hits,
+            (long long)g_core.shader_calls,
+            (long long)g_core.shader_hits,
             (long long)g_core.frames_seen,
             (long long)g_core.input_events,
             (long long)g_core.input_consumed);
@@ -689,11 +770,14 @@ FB_API int fb_attach_host(
 
     {
         fb_menu_telemetry_ptrs_t tptrs;
+        memset(&tptrs, 0, sizeof(tptrs));
         tptrs.dstorage_calls = &g_core.dstorage_calls;
         tptrs.dstorage_hits = &g_core.dstorage_hits;
         tptrs.dstorage_buf_too_small = &g_core.dstorage_buf_too_small;
         tptrs.file_open_calls = &g_core.file_open_calls;
         tptrs.file_open_hits = &g_core.file_open_hits;
+        tptrs.shader_calls = &g_core.shader_calls;
+        tptrs.shader_hits = &g_core.shader_hits;
         tptrs.input_events = &g_core.input_events;
         tptrs.input_consumed = &g_core.input_consumed;
         tptrs.frames_seen = &g_core.frames_seen;
@@ -788,15 +872,20 @@ FB_API int fb_attach_host(
                 if (g_core.bundle.ov_count > 0) {
                     g_core.ov_first_hit = (volatile LONG*)calloc(g_core.bundle.ov_count, sizeof(LONG));
                 }
+                if (g_core.bundle.shader_count > 0) {
+                    g_core.shader_first_hit = (volatile LONG*)calloc(g_core.bundle.shader_count, sizeof(LONG));
+                }
                 char msg[512];
                 snprintf(
                     msg,
                     sizeof(msg),
-                    "Loaded fireball_bundle.fbin (%zu B): %u DirectStorage entries, %u loose overlays, %u plugin configs",
+                    "Loaded fireball_bundle.fbin (v%u, %zu B): %u DirectStorage entries, %u loose overlays, %u plugin configs, %u shader overrides",
+                    g_core.bundle.version,
                     g_core.bundle.raw_size,
                     g_core.bundle.ds_count,
                     g_core.bundle.ov_count,
-                    g_core.bundle.cfg_count);
+                    g_core.bundle.cfg_count,
+                    g_core.bundle.shader_count);
                 core_log(FB_LOG_INFO, "fireball-core", msg);
             } else if (brc == FB_ERR_NOT_FOUND) {
                 core_log(FB_LOG_INFO, "fireball-core", "No fireball_bundle.fbin found in mods_root_dir; continuing without compiled patch bundle");

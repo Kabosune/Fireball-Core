@@ -152,6 +152,7 @@ class ModManifest:
     xml_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_patches: List[Dict[str, Any]] = field(default_factory=list)
     pso_patches: List[Dict[str, Any]] = field(default_factory=list)
+    shader_patches: List[Dict[str, Any]] = field(default_factory=list)
     plugins: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -167,6 +168,7 @@ def load_manifest(source: VirtualModSource) -> ModManifest:
 
     deps = data.get("dependencies", {})
     patches = data.get("patches", {})
+    shader_entries = list(patches.get("shaders", [])) + list(data.get("shaders", []))
     return ModManifest(
         mod_id=str(mod_sec["id"]),
         name=str(mod_sec["name"]),
@@ -183,6 +185,7 @@ def load_manifest(source: VirtualModSource) -> ModManifest:
         xml_patches=list(patches.get("xml", [])),
         kv_patches=list(patches.get("kv", [])),
         pso_patches=list(patches.get("pso", [])),
+        shader_patches=shader_entries,
         plugins=list(data.get("plugins", [])),
         raw=data,
     )

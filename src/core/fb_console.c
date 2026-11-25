@@ -435,6 +435,8 @@ static int cmd_stats(int argc, const char* const* argv, const fb_console_writer_
     long long ds_small = con->telemetry.dstorage_buf_too_small ? (long long)*con->telemetry.dstorage_buf_too_small : 0ll;
     long long fo_calls = con->telemetry.file_open_calls ? (long long)*con->telemetry.file_open_calls : 0ll;
     long long fo_hits  = con->telemetry.file_open_hits  ? (long long)*con->telemetry.file_open_hits  : 0ll;
+    long long sh_calls = con->telemetry.shader_calls    ? (long long)*con->telemetry.shader_calls    : 0ll;
+    long long sh_hits  = con->telemetry.shader_hits     ? (long long)*con->telemetry.shader_hits     : 0ll;
     long long frames   = con->telemetry.frames_seen     ? (long long)*con->telemetry.frames_seen     : 0ll;
     long long in_ev    = con->telemetry.input_events    ? (long long)*con->telemetry.input_events    : 0ll;
     long long in_cons  = con->telemetry.input_consumed  ? (long long)*con->telemetry.input_consumed  : 0ll;
@@ -449,6 +451,11 @@ static int cmd_stats(int argc, const char* const* argv, const fb_console_writer_
         FB_LOG_INFO,
         "FileOpen:      calls=%lld hits=%lld",
         fo_calls, fo_hits);
+    out->print_fmt(
+        out->user_ctx,
+        FB_LOG_INFO,
+        "Shaders:       calls=%lld hits=%lld",
+        sh_calls, sh_hits);
     out->print_fmt(
         out->user_ctx,
         FB_LOG_INFO,

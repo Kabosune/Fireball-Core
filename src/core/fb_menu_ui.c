@@ -244,12 +244,16 @@ void fb_menu_ui_rebuild(fb_menu_ui_t* ui) {
         long long ds_calls = ui->telemetry.dstorage_calls ? (long long)*ui->telemetry.dstorage_calls : 0ll;
         long long ds_hits = ui->telemetry.dstorage_hits ? (long long)*ui->telemetry.dstorage_hits : 0ll;
         long long fo_hits = ui->telemetry.file_open_hits ? (long long)*ui->telemetry.file_open_hits : 0ll;
+        long long sh_calls = ui->telemetry.shader_calls ? (long long)*ui->telemetry.shader_calls : 0ll;
+        long long sh_hits = ui->telemetry.shader_hits ? (long long)*ui->telemetry.shader_hits : 0ll;
         long long frames = ui->telemetry.frames_seen ? (long long)*ui->telemetry.frames_seen : 0ll;
         long long in_ev = ui->telemetry.input_events ? (long long)*ui->telemetry.input_events : 0ll;
         long long in_con = ui->telemetry.input_consumed ? (long long)*ui->telemetry.input_consumed : 0ll;
         snprintf(line, sizeof(line), "DirectStorage: %lld hits / %lld calls   |   Overlays: %lld hits", ds_hits, ds_calls, fo_hits);
         fb_menu_push_row(ui, FB_ROW_INFO, 0u, line, "", 0);
-        snprintf(line, sizeof(line), "Frames: %lld   |   Input events: %lld (%lld consumed)", frames, in_ev, in_con);
+        snprintf(line, sizeof(line), "Shaders: %lld hits / %lld calls   |   Frames: %lld", sh_hits, sh_calls, frames);
+        fb_menu_push_row(ui, FB_ROW_INFO, 0u, line, "", 0);
+        snprintf(line, sizeof(line), "Input events: %lld (%lld consumed)", in_ev, in_con);
         fb_menu_push_row(ui, FB_ROW_INFO, 0u, line, "", 0);
 
         fb_menu_push_row(ui, FB_ROW_HEADER, 0u, "Loaded Plugins", "", 0);

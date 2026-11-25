@@ -192,8 +192,14 @@ static void test_console_engine_and_input(void) {
     fb_settings_set_config_path(&settings, cfg_dir);
 
     volatile LONG64 ds_calls = 42, ds_hits = 7, ds_small = 0;
-    volatile LONG64 fo_calls = 10, fo_hits = 2, frames = 123, in_ev = 55, in_cons = 9;
-    fb_menu_telemetry_ptrs_t tptrs = { &ds_calls, &ds_hits, &ds_small, &fo_calls, &fo_hits, &in_ev, &in_cons, &frames };
+    volatile LONG64 fo_calls = 10, fo_hits = 2, sh_calls = 5, sh_hits = 3;
+    volatile LONG64 frames = 123, in_ev = 55, in_cons = 9;
+    fb_menu_telemetry_ptrs_t tptrs = {
+        &ds_calls, &ds_hits, &ds_small,
+        &fo_calls, &fo_hits,
+        &sh_calls, &sh_hits,
+        &in_ev, &in_cons, &frames
+    };
 
     fb_menu_ui_init(&menu_ui, &lock, &settings, &bindings, &tptrs);
     fb_console_init(&con, &lock, &settings, &bindings, &menu_ui, &tptrs);
@@ -279,6 +285,7 @@ static void test_console_engine_and_input(void) {
     memset(&cap, 0, sizeof(cap));
     CHECK(fb_console_exec(&con, "stats", &w) == FB_OK);
     CHECK(strstr(cap.text, "calls=42 hits=7") != NULL);
+    CHECK(strstr(cap.text, "Shaders:") != NULL && strstr(cap.text, "calls=5 hits=3") != NULL);
     CHECK(strstr(cap.text, "frames_seen=123") != NULL);
 
     memset(&cap, 0, sizeof(cap));

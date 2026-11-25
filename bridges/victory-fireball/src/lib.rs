@@ -423,6 +423,42 @@ impl FireballBridge {
         }
     }
 
+    pub fn try_shader_load(
+        &self,
+        container_blake3: &[u8; 32],
+        dxbc_digest: &[u8; 16],
+        effect_name: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let cb = self.callbacks.on_shader_load?;
+        let effect_cstr = effect_name.and_then(|s| CString::new(s).ok());
+        let effect_ptr = effect_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let mut out_dxil: *const c_void = std::ptr::null();
+        let mut out_size: usize = 0;
+        let hit = unsafe {
+            cb(
+                container_blake3.as_ptr(),
+                dxbc_digest.as_ptr(),
+                effect_ptr,
+                &mut out_dxil,
+                &mut out_size,
+            )
+        };
+        if hit == 1 {
+            if out_size == 0 {
+                return Some(Vec::new());
+            }
+            if out_dxil.is_null() {
+                return None;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(out_dxil as *const u8, out_size) };
+            Some(bytes.to_vec())
+        } else {
+            None
+        }
+    }
+
     pub fn dispatch_input_event(&self, ev: &InputEvent) -> bool {
         let Some(cb) = self.callbacks.on_input_event else {
             return false;
@@ -516,6 +552,19 @@ pub fn try_file_open(rel_path: &str) -> Option<VirtualOverlayFile> {
     if let Ok(guard) = global_slot().read() {
         if let Some(b) = guard.as_ref() {
             return b.try_file_open(rel_path);
+        }
+    }
+    None
+}
+
+pub fn try_shader_load(
+    container_blake3: &[u8; 32],
+    dxbc_digest: &[u8; 16],
+    effect_name: Option<&str>,
+) -> Option<Vec<u8>> {
+    if let Ok(guard) = global_slot().read() {
+        if let Some(b) = guard.as_ref() {
+            return b.try_shader_load(container_blake3, dxbc_digest, effect_name);
         }
     }
     None

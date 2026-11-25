@@ -52,6 +52,13 @@ uint64_t fb_dstorage_fallback_hash(const char* norm_path, size_t path_len, uint6
     return fb_dstorage_key_hash(norm_path, path_len, file_offset, 0u);
 }
 
+uint64_t fb_shader_key_hash(const uint8_t container_blake3[32], const uint8_t dxbc_digest[16]) {
+    uint8_t key[48];
+    memcpy(key, container_blake3, 32u);
+    memcpy(key + 32u, dxbc_digest, 16u);
+    return fb_fnv1a_64(key, sizeof(key));
+}
+
 uint32_t fb_crc32_ieee(const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
     uint32_t crc = 0xFFFFFFFFu;
@@ -296,6 +303,26 @@ static int fb_build_hash_tables(fb_bundle_t* b, char* err_buf, size_t err_cap) {
         }
     }
 
+    if (b->shader_count > 0) {
+        uint32_t cap = fb_next_pow2(b->shader_count * 2u + 1u);
+        b->shader_slots = (fb_hash_slot_t*)calloc(cap, sizeof(fb_hash_slot_t));
+        if (!b->shader_slots) {
+            fb_set_err(err_buf, err_cap, "Out of memory allocating shader override hash table");
+            return FB_ERR_INTERNAL;
+        }
+        b->shader_mask = cap - 1u;
+        for (uint32_t i = 0; i < b->shader_count; ++i) {
+            const fb_bundle_shader_entry_t* e = &b->shader_entries[i];
+            uint32_t slot = (uint32_t)(e->key_hash & b->shader_mask);
+            while (b->shader_slots[slot].occupied) {
+                slot = (slot + 1u) & b->shader_mask;
+            }
+            b->shader_slots[slot].hash = e->key_hash;
+            b->shader_slots[slot].index = i;
+            b->shader_slots[slot].occupied = 1u;
+        }
+    }
+
     return FB_OK;
 }
 
@@ -363,7 +390,11 @@ int fb_bundle_load_file(const wchar_t* file_path, fb_bundle_t* out_bundle, char*
 
     fb_bundle_header_t hdr;
     memcpy(&hdr, raw, sizeof(hdr));
-    if (hdr.magic != FB_BUNDLE_MAGIC || hdr.version != FB_BUNDLE_VERSION || hdr.header_size != FB_BUNDLE_HEADER_SIZE) {
+    int valid_v1 = (hdr.version == FB_BUNDLE_VERSION && hdr.header_size == FB_BUNDLE_HEADER_SIZE);
+    int valid_v2 = (hdr.version == FB_BUNDLE_VERSION_V2 &&
+                    hdr.header_size == FB_BUNDLE_HEADER_V2_SIZE &&
+                    file_size >= sizeof(fb_bundle_header_v2_t));
+    if (hdr.magic != FB_BUNDLE_MAGIC || (!valid_v1 && !valid_v2)) {
         free(raw);
         fb_set_err(err_buf, err_cap, "Invalid fireball_bundle.fbin header magic/version");
         return FB_ERR_ABI_MISMATCH;
@@ -374,13 +405,24 @@ int fb_bundle_load_file(const wchar_t* file_path, fb_bundle_t* out_bundle, char*
         return FB_ERR_INVALID_ARG;
     }
 
+    uint32_t shader_count = 0u;
+    uint64_t shader_table_off = 0ull;
+    if (valid_v2) {
+        fb_bundle_header_v2_t hdr2;
+        memcpy(&hdr2, raw, sizeof(hdr2));
+        shader_count = hdr2.shader_count;
+        shader_table_off = hdr2.shader_table_off;
+    }
+
     uint64_t ds_bytes = (uint64_t)hdr.dstorage_count * sizeof(fb_bundle_dstorage_entry_t);
     uint64_t ov_bytes = (uint64_t)hdr.overlay_count * sizeof(fb_bundle_overlay_entry_t);
     uint64_t cfg_bytes = (uint64_t)hdr.plugin_config_count * sizeof(fb_bundle_plugin_cfg_entry_t);
+    uint64_t sh_bytes = (uint64_t)shader_count * sizeof(fb_bundle_shader_entry_t);
 
     if (!fb_validate_range(file_size, hdr.dstorage_table_off, ds_bytes) ||
         !fb_validate_range(file_size, hdr.overlay_table_off, ov_bytes) ||
-        !fb_validate_range(file_size, hdr.plugin_cfg_table_off, cfg_bytes))
+        !fb_validate_range(file_size, hdr.plugin_cfg_table_off, cfg_bytes) ||
+        (shader_count > 0u && !fb_validate_range(file_size, shader_table_off, sh_bytes)))
     {
         free(raw);
         fb_set_err(err_buf, err_cap, "Bundle section table offsets out of bounds");
@@ -389,12 +431,15 @@ int fb_bundle_load_file(const wchar_t* file_path, fb_bundle_t* out_bundle, char*
 
     out_bundle->raw_data = raw;
     out_bundle->raw_size = file_size;
+    out_bundle->version = hdr.version;
     out_bundle->ds_entries = (const fb_bundle_dstorage_entry_t*)(raw + hdr.dstorage_table_off);
     out_bundle->ds_count = hdr.dstorage_count;
     out_bundle->ov_entries = (const fb_bundle_overlay_entry_t*)(raw + hdr.overlay_table_off);
     out_bundle->ov_count = hdr.overlay_count;
     out_bundle->cfg_entries = (const fb_bundle_plugin_cfg_entry_t*)(raw + hdr.plugin_cfg_table_off);
     out_bundle->cfg_count = hdr.plugin_config_count;
+    out_bundle->shader_entries = (shader_count > 0u) ? (const fb_bundle_shader_entry_t*)(raw + shader_table_off) : NULL;
+    out_bundle->shader_count = shader_count;
 
     /* Validate every entry's string bounds, payload bounds, key hash, and CRC32 */
     for (uint32_t i = 0; i < out_bundle->ds_count; ++i) {
@@ -458,6 +503,32 @@ int fb_bundle_load_file(const wchar_t* file_path, fb_bundle_t* out_bundle, char*
         }
     }
 
+    for (uint32_t i = 0; i < out_bundle->shader_count; ++i) {
+        const fb_bundle_shader_entry_t* e = &out_bundle->shader_entries[i];
+        if ((e->name_len > 0u || e->name_offset != 0u) &&
+            !fb_validate_string(raw, file_size, e->name_offset, e->name_len))
+        {
+            fb_bundle_free(out_bundle);
+            fb_set_err(err_buf, err_cap, "Shader entry name string out of bounds");
+            return FB_ERR_INVALID_ARG;
+        }
+        if (!fb_validate_range(file_size, e->payload_offset, e->payload_size)) {
+            fb_bundle_free(out_bundle);
+            fb_set_err(err_buf, err_cap, "Shader entry payload out of bounds");
+            return FB_ERR_INVALID_ARG;
+        }
+        if (fb_shader_key_hash(e->container_blake3, e->dxbc_digest) != e->key_hash) {
+            fb_bundle_free(out_bundle);
+            fb_set_err(err_buf, err_cap, "Shader entry key_hash mismatch");
+            return FB_ERR_INVALID_ARG;
+        }
+        if (fb_crc32_ieee(raw + e->payload_offset, e->payload_size) != e->payload_crc32) {
+            fb_bundle_free(out_bundle);
+            fb_set_err(err_buf, err_cap, "Shader entry payload CRC32 mismatch");
+            return FB_ERR_INVALID_ARG;
+        }
+    }
+
     int rc = fb_build_hash_tables(out_bundle, err_buf, err_cap);
     if (rc != FB_OK) {
         fb_bundle_free(out_bundle);
@@ -474,6 +545,7 @@ void fb_bundle_free(fb_bundle_t* bundle) {
     free(bundle->ds_fallback_slots);
     free(bundle->ov_slots);
     free(bundle->cfg_slots);
+    free(bundle->shader_slots);
     free(bundle->raw_data);
     memset(bundle, 0, sizeof(*bundle));
 }
@@ -589,6 +661,34 @@ const fb_bundle_plugin_cfg_entry_t* fb_bundle_find_plugin_cfg(
             }
         }
         slot = (slot + 1u) & bundle->cfg_mask;
+    }
+    return NULL;
+}
+
+const fb_bundle_shader_entry_t* fb_bundle_find_shader(
+    const fb_bundle_t* bundle,
+    const uint8_t      container_blake3[32],
+    const uint8_t      dxbc_digest[16])
+{
+    if (!bundle || !container_blake3 || !dxbc_digest || bundle->shader_count == 0u || !bundle->shader_slots) {
+        return NULL;
+    }
+    uint64_t h = fb_shader_key_hash(container_blake3, dxbc_digest);
+    uint32_t slot = (uint32_t)(h & bundle->shader_mask);
+    for (uint32_t probe = 0; probe <= bundle->shader_mask; ++probe) {
+        const fb_hash_slot_t* s = &bundle->shader_slots[slot];
+        if (!s->occupied) {
+            break;
+        }
+        if (s->hash == h) {
+            const fb_bundle_shader_entry_t* e = &bundle->shader_entries[s->index];
+            if (memcmp(e->container_blake3, container_blake3, 32u) == 0 &&
+                memcmp(e->dxbc_digest, dxbc_digest, 16u) == 0)
+            {
+                return e;
+            }
+        }
+        slot = (slot + 1u) & bundle->shader_mask;
     }
     return NULL;
 }

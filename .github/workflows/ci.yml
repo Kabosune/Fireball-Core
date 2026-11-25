@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-build-and-test:
+    runs-on: windows-latest
+    env:
+      FIREBALL_HEADLESS: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure CMake (VS 2022 x64)
+        shell: pwsh
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build C11 Core, Plugins & Native Tests (Release)
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Build C11 Core, Plugins & Native Tests (Debug)
+        shell: pwsh
+        run: cmake --build build --config Debug
+
+      - name: Run Native CTest Suite (Release)
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Run Native CTest Suite (Debug)
+        shell: pwsh
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Run Rust victory-fireball Bridge Tests
+        shell: pwsh
+        run: cargo test --manifest-path bridges/victory-fireball/Cargo.toml
+
+      - name: Run Python Offline Unit Tests & CLI Smoke Checks
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -v
+          python -B fireball_cli.py --help
+          python -B fireball_cli.py stage --help
