@@ -13,7 +13,9 @@
 #include <windows.h>
 
 #include "fireball_plugin.h"
+#include "fireball_console.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,13 +169,60 @@ static int file_contains(const char* path, const char* needle) {
 typedef int (*query_fn)(fb_plugin_info_v1_t*);
 typedef int (*init_fn)(const fb_core_services_v1_t*);
 typedef void (*shutdown_fn)(void);
+typedef int (*reg_console_fn)(const fb_console_api_v1_t*);
 
 typedef struct plugin {
-    HMODULE     mod;
-    query_fn    query;
-    init_fn     init;
-    shutdown_fn shutdown;
+    HMODULE        mod;
+    query_fn       query;
+    init_fn        init;
+    shutdown_fn    shutdown;
+    reg_console_fn reg_console;
 } plugin_t;
+
+/* Minimal mock console registry for testing fb_plugin_register_console() directly */
+static fb_command_desc_v1_t g_mock_cmds[16];
+static int                  g_mock_cmd_count = 0;
+static char                 g_mock_con_out[2048];
+
+static void mock_con_reset(void) {
+    g_mock_cmd_count = 0;
+    g_mock_con_out[0] = '\0';
+}
+
+static int mock_con_register(const fb_command_desc_v1_t* desc) {
+    if (!desc || !desc->name || !desc->callback || g_mock_cmd_count >= 16) {
+        return FB_ERR_INVALID_ARG;
+    }
+    g_mock_cmds[g_mock_cmd_count++] = *desc;
+    return FB_OK;
+}
+
+static void mock_con_print(void* ctx, int level, const char* text) {
+    (void)ctx;
+    (void)level;
+    size_t cur = strlen(g_mock_con_out);
+    snprintf(g_mock_con_out + cur, sizeof(g_mock_con_out) - cur, "%s\n", text ? text : "");
+}
+
+static void mock_con_print_fmt(void* ctx, int level, const char* fmt, ...) {
+    char tmp[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    mock_con_print(ctx, level, tmp);
+}
+
+static int mock_con_call(const char* name, int argc, const char* const* argv) {
+    g_mock_con_out[0] = '\0';
+    fb_console_writer_v1_t w = { (uint32_t)sizeof(w), 0u, NULL, mock_con_print, mock_con_print_fmt };
+    for (int i = 0; i < g_mock_cmd_count; ++i) {
+        if (strcmp(g_mock_cmds[i].name, name) == 0) {
+            return g_mock_cmds[i].callback(argc, argv, &w, g_mock_cmds[i].user_ctx);
+        }
+    }
+    return FB_ERR_NOT_FOUND;
+}
 
 static int load_plugin(const wchar_t* path, plugin_t* p) {
     p->mod = LoadLibraryW(path);
@@ -184,6 +233,7 @@ static int load_plugin(const wchar_t* path, plugin_t* p) {
     p->query = (query_fn)(void*)GetProcAddress(p->mod, "fb_plugin_query");
     p->init = (init_fn)(void*)GetProcAddress(p->mod, "fb_plugin_init");
     p->shutdown = (shutdown_fn)(void*)GetProcAddress(p->mod, "fb_plugin_shutdown");
+    p->reg_console = (reg_console_fn)(void*)GetProcAddress(p->mod, "fb_plugin_register_console");
     return p->query && p->init && p->shutdown;
 }
 
@@ -294,6 +344,46 @@ static void test_time_weather(const wchar_t* dll, const char* tmp) {
     for (int i = 0; i < 5; ++i) {
         frame(); /* let verify reads come due */
     }
+
+    /* Console commands: time & weather */
+    CHECK(p.reg_console != NULL);
+    if (p.reg_console) {
+        mock_con_reset();
+        fb_console_api_v1_t capi = { (uint32_t)sizeof(capi), FB_CONSOLE_ABI_VERSION, mock_con_register, NULL, NULL };
+        CHECK(p.reg_console(&capi) == FB_OK);
+
+        const char* a_time[] = { "time", "14:45" };
+        CHECK(mock_con_call("time", 2, a_time) == FB_OK);
+        frame();
+        CHECK(mem_u32(0x100) == 14 && mem_u32(0x104) == 45);
+
+        const char* a_pause[] = { "time", "pause" };
+        CHECK(mock_con_call("time", 2, a_pause) == FB_OK);
+        frame();
+        set_u32(0x104, 50);
+        frame();
+        CHECK(mem_u32(0x104) == 45);
+
+        const char* a_resume[] = { "time", "resume" };
+        CHECK(mock_con_call("time", 2, a_resume) == FB_OK);
+        const char* a_scale[] = { "time", "scale", "2.0" };
+        CHECK(mock_con_call("time", 3, a_scale) == FB_OK);
+        frame();
+
+        const char* a_wlist[] = { "weather", "list" };
+        CHECK(mock_con_call("weather", 2, a_wlist) == FB_OK);
+        CHECK(strstr(g_mock_con_out, "MISTY") != NULL);
+
+        const char* a_wset[] = { "weather", "MISTY" };
+        CHECK(mock_con_call("weather", 2, a_wset) == FB_OK);
+        frame();
+        CHECK(mem_u32(0x200) == H2 && mem_u32(0x204) == H2);
+
+        const char* a_wunlock[] = { "weather", "unlock" };
+        CHECK(mock_con_call("weather", 2, a_wunlock) == FB_OK);
+        frame();
+    }
+
     p.shutdown();
     CHECK(file_contains(log, ",set,clock.h,"));
     CHECK(file_contains(log, ",verify,clock.h,"));
@@ -362,6 +452,32 @@ static void test_state_scan(const wchar_t* dll, const char* tmp) {
     frame();
     frame();
     frame();
+
+    /* Console commands: scan.snap, scan.read, scan.write */
+    CHECK(p.reg_console != NULL);
+    if (p.reg_console) {
+        mock_con_reset();
+        fb_console_api_v1_t capi = { (uint32_t)sizeof(capi), FB_CONSOLE_ABI_VERSION, mock_con_register, NULL, NULL };
+        CHECK(p.reg_console(&capi) == FB_OK);
+
+        DeleteFileA(req);
+        const char* a_snap[] = { "scan.snap", "run" };
+        CHECK(mock_con_call("scan.snap", 2, a_snap) == FB_OK);
+        CHECK(file_contains(req, "run"));
+
+        const char* a_write[] = { "scan.write", "0x308", "0x1234" };
+        CHECK(mock_con_call("scan.write", 3, a_write) == FB_OK);
+        CHECK(mem_u32(0x308) == 0x1234u);
+
+        const char* a_writef[] = { "scan.write", "0x30C", "f2.5" };
+        CHECK(mock_con_call("scan.write", 3, a_writef) == FB_OK);
+        CHECK(mem_u32(0x30C) == 0x40200000u);
+
+        const char* a_read[] = { "scan.read", "0x308" };
+        CHECK(mock_con_call("scan.read", 2, a_read) == FB_OK);
+        CHECK(strstr(g_mock_con_out, "0x00001234") != NULL);
+    }
+
     p.shutdown();
     CHECK(file_contains(log, ",watch,0x00000300,0x00000007,changed"));
     CHECK(file_contains(log, ",write_test,0x00000300,0x0000002A,"));

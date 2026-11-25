@@ -11,10 +11,11 @@ all outputs/diffs/exports go under `--out` (default: `D:\\GTA6-work\\fireball-fp
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ROOT_DIR not in sys.path:
@@ -349,6 +350,175 @@ def cmd_inspect_bundle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _normalize_pipe_name(pipe_arg: Optional[str]) -> str:
+    raw = pipe_arg or os.environ.get("FIREBALL_CONSOLE_PIPE") or r"\\.\pipe\fireball_console"
+    if raw.lower().startswith("\\\\.\\pipe\\"):
+        return raw
+    return "\\\\.\\pipe\\" + raw
+
+
+class _Win32ConsolePipeClient:
+    r"""Stdlib-only Win32 named-pipe client for `\\.\pipe\fireball_console`."""
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    ERROR_PIPE_BUSY = 231
+
+    def __init__(self, pipe_name: str, timeout_ms: int = 3000) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("Fireball console named pipe is only supported on Windows.")
+        self.pipe_name = pipe_name
+        self.timeout_ms = timeout_ms
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._k32.CreateFileW.restype = ctypes.c_void_p
+        self._k32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        self._k32.WaitNamedPipeW.restype = ctypes.c_int
+        self._k32.WaitNamedPipeW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        self._k32.ReadFile.restype = ctypes.c_int
+        self._k32.ReadFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self._k32.WriteFile.restype = ctypes.c_int
+        self._k32.WriteFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        self._k32.CloseHandle.restype = ctypes.c_int
+        self._k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._handle: Optional[int] = None
+        self._rx_buf = bytearray()
+
+    def connect(self) -> None:
+        for _ in range(4):
+            h = self._k32.CreateFileW(
+                self.pipe_name,
+                self.GENERIC_READ | self.GENERIC_WRITE,
+                0,
+                None,
+                self.OPEN_EXISTING,
+                0,
+                None,
+            )
+            if h != self.INVALID_HANDLE_VALUE and h is not None:
+                self._handle = h
+                return
+            err = ctypes.get_last_error()
+            if err == self.ERROR_PIPE_BUSY:
+                self._k32.WaitNamedPipeW(self.pipe_name, self.timeout_ms)
+                continue
+            raise OSError(err, f"Could not connect to Fireball console pipe '{self.pipe_name}' (Win32 error {err})")
+        raise OSError(self.ERROR_PIPE_BUSY, f"Timed out waiting for busy pipe '{self.pipe_name}'")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._k32.CloseHandle(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "_Win32ConsolePipeClient":
+        self.connect()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def _readline(self) -> Optional[str]:
+        assert self._handle is not None
+        while True:
+            nl = self._rx_buf.find(b"\n")
+            if nl != -1:
+                raw = bytes(self._rx_buf[:nl])
+                del self._rx_buf[: nl + 1]
+                return raw.rstrip(b"\r").decode("utf-8", errors="replace")
+            buf = ctypes.create_string_buffer(4096)
+            got = ctypes.c_uint32(0)
+            ok = self._k32.ReadFile(self._handle, buf, 4096, ctypes.byref(got), None)
+            if not ok or got.value == 0:
+                if self._rx_buf:
+                    raw = bytes(self._rx_buf)
+                    self._rx_buf.clear()
+                    return raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
+                return None
+            self._rx_buf.extend(buf.raw[: got.value])
+
+    def exec_command(self, line: str) -> Tuple[int, List[str]]:
+        assert self._handle is not None
+        payload = (line.replace("\r", "").replace("\n", " ") + "\n").encode("utf-8")
+        written = ctypes.c_uint32(0)
+        ok = self._k32.WriteFile(self._handle, payload, len(payload), ctypes.byref(written), None)
+        if not ok or written.value != len(payload):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"WriteFile failed on '{self.pipe_name}' (Win32 error {err})")
+
+        lines: List[str] = []
+        rc = 0
+        while True:
+            resp = self._readline()
+            if resp is None:
+                raise ConnectionError("Fireball console pipe closed unexpectedly.")
+            if resp.startswith("\x04"):
+                try:
+                    rc = int(resp[1:].strip() or "0")
+                except ValueError:
+                    rc = 0
+                break
+            lines.append(resp)
+        return rc, lines
+
+
+def cmd_console(args: argparse.Namespace) -> int:
+    pipe_name = _normalize_pipe_name(args.pipe)
+    one_shot: List[str] = list(args.command or [])
+    try:
+        with _Win32ConsolePipeClient(pipe_name, timeout_ms=args.timeout_ms) as client:
+            if one_shot:
+                exit_rc = 0
+                for cmd_line in one_shot:
+                    rc, out_lines = client.exec_command(cmd_line)
+                    for ln in out_lines:
+                        print(ln)
+                    if rc != 0:
+                        exit_rc = 1
+                return exit_rc
+
+            print(f"Connected to Fireball Console ({pipe_name}). Type 'help' or 'exit'.")
+            while True:
+                try:
+                    line = input("fireball> ")
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return 0
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.lower() in ("exit", "quit"):
+                    return 0
+                rc, out_lines = client.exec_command(stripped)
+                for ln in out_lines:
+                    print(ln)
+                if rc != 0 and not out_lines:
+                    print(f"[rc={rc}]")
+    except (OSError, ConnectionError, RuntimeError) as exc:
+        print(f"Console error: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_verify_all(args: argparse.Namespace) -> int:
     """Run the full end-to-end vertical-slice test suite in one command."""
     _check_out_not_in_game_dir(args.out, args.game_dir)
@@ -573,6 +743,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.add_argument("bundle", help="Path to fireball_bundle.fbin")
     p_ins.add_argument("--json", action="store_true", help="Emit structured JSON instead of a table")
 
+    p_con = sub.add_parser(
+        "console",
+        help="Attach to a live Fireball-Core named-pipe console (interactive REPL or one-shot -c).",
+    )
+    p_con.add_argument(
+        "-c",
+        "--command",
+        action="append",
+        default=None,
+        help="Execute one or more commands non-interactively and exit (repeatable)",
+    )
+    p_con.add_argument(
+        "--pipe",
+        default=None,
+        help=r"Named pipe path or short name (default: env FIREBALL_CONSOLE_PIPE or \\.\pipe\fireball_console)",
+    )
+    p_con.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=3000,
+        help="Timeout in milliseconds when waiting for a busy pipe (default: 3000)",
+    )
+
     p_all = sub.add_parser("verify-all", help="Run the full end-to-end vertical-slice verification suite.")
     p_all.add_argument("--mod", default=DEFAULT_MOD_DIR, help="Loose mod folder (default: examples/fpv_unlocker)")
     return p
@@ -589,6 +782,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "simulate": cmd_simulate,
         "build-bundle": cmd_build_bundle,
         "inspect-bundle": cmd_inspect_bundle,
+        "console": cmd_console,
         "verify-all": cmd_verify_all,
     }
     return dispatch[args.cmd](args)

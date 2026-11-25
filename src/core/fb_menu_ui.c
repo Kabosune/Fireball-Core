@@ -112,6 +112,7 @@ void fb_menu_ui_set_host_snapshot(
                 snprintf(ui->loaded_plugins[i].plugin_id, sizeof(ui->loaded_plugins[i].plugin_id), "%s", plugin_mgr->plugins[i].plugin_id);
                 snprintf(ui->loaded_plugins[i].version, sizeof(ui->loaded_plugins[i].version), "%s", plugin_mgr->plugins[i].version);
                 ui->loaded_plugins[i].has_menu_api = plugin_mgr->plugins[i].has_menu_api;
+                ui->loaded_plugins[i].has_console_api = plugin_mgr->plugins[i].has_console_api;
             }
         }
     }

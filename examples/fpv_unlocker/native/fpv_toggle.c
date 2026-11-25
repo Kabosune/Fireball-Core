@@ -15,6 +15,7 @@
 
 #include "fireball_plugin.h"
 #include "fireball_menu.h"
+#include "fireball_console.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -437,6 +438,111 @@ FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
 
     g_fpv.menu_registered = 1;
     return FB_OK;
+}
+
+static int fpv_set_latched(int target_latched) {
+    uint32_t target_mode = target_latched ? g_fpv.first_person_mode : g_fpv.third_person_mode;
+    int wrc = g_fpv.core.title_mem_write_u32(g_fpv.view_mode_va, target_mode);
+    if (wrc != FB_OK) {
+        return wrc;
+    }
+    if (g_fpv.fpv_latched != (target_latched ? 1 : 0)) {
+        g_fpv.toggle_count += 1;
+    }
+    g_fpv.fpv_latched = target_latched ? 1 : 0;
+    return FB_OK;
+}
+
+static int fpv_console_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_fpv.initialized) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "fpv_toggle is not initialized");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+
+    if (argc < 2 || _stricmp(argv[1], "status") == 0) {
+        uint32_t cur = 0;
+        int rc = g_fpv.core.title_mem_read_u32(g_fpv.view_mode_va, &cur);
+        if (out && out->print_fmt) {
+            out->print_fmt(
+                out->user_ctx,
+                FB_LOG_INFO,
+                "fpv=%s view_mode=%u%s hold_guard=%s toggles=%llu reasserts=%llu",
+                g_fpv.fpv_latched ? "on" : "off",
+                cur,
+                (rc == FB_OK) ? "" : " (read-fault)",
+                g_fpv.hold_guard_enabled ? "on" : "off",
+                (unsigned long long)g_fpv.toggle_count,
+                (unsigned long long)g_fpv.reassert_count);
+        }
+        return FB_OK;
+    }
+
+    if (_stricmp(argv[1], "toggle") == 0) {
+        if (!fpv_perform_toggle()) {
+            if (out && out->print) {
+                out->print(out->user_ctx, FB_LOG_ERROR, "fpv toggle failed (memory fault)");
+            }
+            return FB_ERR_MEM_FAULT;
+        }
+    } else if (_stricmp(argv[1], "on") == 0 || _stricmp(argv[1], "1") == 0 || _stricmp(argv[1], "true") == 0) {
+        int rc = fpv_set_latched(1);
+        if (rc != FB_OK) {
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_ERROR, "fpv on failed (rc=%d)", rc);
+            }
+            return rc;
+        }
+    } else if (_stricmp(argv[1], "off") == 0 || _stricmp(argv[1], "0") == 0 || _stricmp(argv[1], "false") == 0) {
+        int rc = fpv_set_latched(0);
+        if (rc != FB_OK) {
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_ERROR, "fpv off failed (rc=%d)", rc);
+            }
+            return rc;
+        }
+    } else {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_ERROR, "Usage: fpv [on|off|toggle|status]");
+        }
+        return FB_ERR_INVALID_ARG;
+    }
+
+    if (out && out->print_fmt) {
+        out->print_fmt(
+            out->user_ctx,
+            FB_LOG_INFO,
+            "fpv -> %s (view_mode=%u)",
+            g_fpv.fpv_latched ? "on" : "off",
+            g_fpv.fpv_latched ? g_fpv.first_person_mode : g_fpv.third_person_mode);
+    }
+    return FB_OK;
+}
+
+FB_API int fb_plugin_register_console(const fb_console_api_v1_t* console) {
+    if (!console || console->abi_version != FB_CONSOLE_ABI_VERSION || console->struct_size < sizeof(fb_console_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!console->register_command) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    fb_command_desc_v1_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.struct_size = (uint32_t)sizeof(cmd);
+    cmd.mod_id = FPV_MOD_ID;
+    cmd.name = "fpv";
+    cmd.usage = "fpv [on|off|toggle|status]";
+    cmd.description = "Control or inspect on-foot First-Person View latch";
+    cmd.callback = fpv_console_cmd;
+    cmd.user_ctx = &g_fpv;
+    return console->register_command(&cmd);
 }
 
 FB_API void fb_plugin_shutdown(void) {

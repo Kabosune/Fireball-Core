@@ -32,6 +32,7 @@
 
 #include "fireball_plugin.h"
 #include "fireball_menu.h"
+#include "fireball_console.h"
 #include "time_weather.h"
 
 #include <ctype.h>
@@ -1280,6 +1281,238 @@ FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
 
     g_tw.menu_registered = 1;
     return FB_OK;
+}
+
+static int tw_console_time_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_tw.initialized || !g_tw.clock_ok) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "time_weather clock is unavailable");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+    if (argc < 2 || _stricmp(argv[1], "status") == 0) {
+        tw_status_t st;
+        tw_get_status(&st);
+        unsigned t = (unsigned)st.tod_sec;
+        if (out && out->print_fmt) {
+            out->print_fmt(
+                out->user_ctx,
+                FB_LOG_INFO,
+                "time=%02u:%02u:%02u paused=%s scale=%.2fx writes=%llu",
+                t / 3600u, (t % 3600u) / 60u, t % 60u,
+                st.paused ? "true" : "false",
+                st.scale,
+                (unsigned long long)st.writes);
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "pause") == 0) {
+        tw_cmd_set_pause(1);
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_INFO, "Clock pause queued");
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "resume") == 0) {
+        tw_cmd_set_pause(0);
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_INFO, "Clock resume queued");
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "scale") == 0) {
+        if (argc < 3) {
+            if (out && out->print) {
+                out->print(out->user_ctx, FB_LOG_ERROR, "Usage: time scale <factor>");
+            }
+            return FB_ERR_INVALID_ARG;
+        }
+        char* end = NULL;
+        double sc = strtod(argv[2], &end);
+        if (end == argv[2] || *end != '\0' || sc < 0.0) {
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_ERROR, "Invalid scale '%s'", argv[2]);
+            }
+            return FB_ERR_INVALID_ARG;
+        }
+        tw_cmd_set_scale(sc);
+        if (out && out->print_fmt) {
+            out->print_fmt(out->user_ctx, FB_LOG_INFO, "Clock scale -> %.2fx (queued)", sc);
+        }
+        return FB_OK;
+    }
+    if (argv[1][0] == '+' || argv[1][0] == '-') {
+        char* end = NULL;
+        long delta = strtol(argv[1], &end, 10);
+        if (end != argv[1] && *end == '\0') {
+            tw_cmd_add_hours((int)delta);
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_INFO, "Clock shift %+ldh (queued)", delta);
+            }
+            return FB_OK;
+        }
+    }
+
+    /* Parse HH, HH:MM, or HH:MM:SS */
+    unsigned hh = 0, mm = 0, ss = 0;
+    char extra = '\0';
+    int parts = sscanf(argv[1], "%u:%u:%u%c", &hh, &mm, &ss, &extra);
+    if (parts >= 1 && parts <= 3 && hh < 24u && mm < 60u && ss < 60u) {
+        if (parts == 1) {
+            /* Ensure pure digits for HH */
+            for (const char* p = argv[1]; *p; ++p) {
+                if (!isdigit((unsigned char)*p)) {
+                    parts = 0;
+                    break;
+                }
+            }
+        }
+        if (parts >= 1) {
+            double tod = (double)hh * 3600.0 + (double)mm * 60.0 + (double)ss;
+            tw_cmd_set_tod(tod);
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_INFO, "Clock -> %02u:%02u:%02u (queued)", hh, mm, ss);
+            }
+            return FB_OK;
+        }
+    }
+
+    if (out && out->print) {
+        out->print(out->user_ctx, FB_LOG_ERROR, "Usage: time <HH[:MM[:SS]]|pause|resume|scale <f>|status>");
+    }
+    return FB_ERR_INVALID_ARG;
+}
+
+static int tw_console_weather_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_tw.initialized || !g_tw.weather_ok) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "time_weather weather control is unavailable");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+    if (argc < 2 || _stricmp(argv[1], "status") == 0) {
+        tw_status_t st;
+        tw_get_status(&st);
+        const tw_weather_entry_t* cur = st.weather_cur >= 0 ? tw_weather_at((uint32_t)st.weather_cur) : NULL;
+        const tw_weather_entry_t* tgt = st.weather_target >= 0 ? tw_weather_at((uint32_t)st.weather_target) : NULL;
+        if (out && out->print_fmt) {
+            out->print_fmt(
+                out->user_ctx,
+                FB_LOG_INFO,
+                "weather now=%s target=%s locked=%s blend=%.0f%%",
+                cur ? cur->name : "?",
+                tgt ? tgt->name : "-",
+                st.weather_locked ? "true" : "false",
+                st.blend_progress * 100.0);
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "list") == 0) {
+        if (out && out->print_fmt) {
+            out->print_fmt(out->user_ctx, FB_LOG_INFO, "Weather presets (%u):", g_tw.weather_count);
+            for (uint32_t i = 0; i < g_tw.weather_count; ++i) {
+                out->print_fmt(
+                    out->user_ctx,
+                    FB_LOG_INFO,
+                    "  [%u] %s (0x%08X)",
+                    i,
+                    g_tw.weathers[i].name,
+                    g_tw.weathers[i].joaat_lower);
+            }
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "lock") == 0) {
+        tw_cmd_set_lock(1);
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_INFO, "Weather lock enabled (queued)");
+        }
+        return FB_OK;
+    }
+    if (_stricmp(argv[1], "unlock") == 0) {
+        tw_cmd_set_lock(0);
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_INFO, "Weather lock disabled (queued)");
+        }
+        return FB_OK;
+    }
+
+    int blend = (argc >= 3 && _stricmp(argv[2], "blend") == 0) ? 1 : 0;
+    int32_t found_idx = -1;
+    for (uint32_t i = 0; i < g_tw.weather_count; ++i) {
+        if (_stricmp(g_tw.weathers[i].name, argv[1]) == 0) {
+            found_idx = (int32_t)i;
+            break;
+        }
+    }
+    if (found_idx < 0) {
+        char* end = NULL;
+        long idx = strtol(argv[1], &end, 0);
+        if (end != argv[1] && *end == '\0' && idx >= 0) {
+            if (g_tw.weather_count == 0 ? g_tw.weather_kind_index != 0 : (uint32_t)idx < g_tw.weather_count) {
+                found_idx = (int32_t)idx;
+            }
+        }
+    }
+    if (found_idx < 0) {
+        if (out && out->print_fmt) {
+            out->print_fmt(out->user_ctx, FB_LOG_ERROR, "Unknown weather '%s' (try 'weather list')", argv[1]);
+        }
+        return FB_ERR_NOT_FOUND;
+    }
+
+    tw_cmd_set_weather(found_idx, blend);
+    const tw_weather_entry_t* e = tw_weather_at((uint32_t)found_idx);
+    if (out && out->print_fmt) {
+        out->print_fmt(
+            out->user_ctx,
+            FB_LOG_INFO,
+            "Weather -> #%d %s%s (queued)",
+            found_idx,
+            e ? e->name : "",
+            blend ? " [blend]" : "");
+    }
+    return FB_OK;
+}
+
+FB_API int fb_plugin_register_console(const fb_console_api_v1_t* console) {
+    if (!console || console->abi_version != FB_CONSOLE_ABI_VERSION || console->struct_size < sizeof(fb_console_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!console->register_command) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    fb_command_desc_v1_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.struct_size = (uint32_t)sizeof(cmd);
+    cmd.mod_id = TW_MOD_ID;
+    cmd.user_ctx = &g_tw;
+
+    cmd.name = "time";
+    cmd.usage = "time <HH[:MM[:SS]]|pause|resume|scale <f>|status>";
+    cmd.description = "Set, pause/resume, or scale single-player clock";
+    cmd.callback = tw_console_time_cmd;
+    int rc1 = console->register_command(&cmd);
+
+    cmd.name = "weather";
+    cmd.usage = "weather <name|index|lock|unlock|list|status> [blend]";
+    cmd.description = "Switch, blend, lock/unlock, or list weather presets";
+    cmd.callback = tw_console_weather_cmd;
+    int rc2 = console->register_command(&cmd);
+
+    return (rc1 == FB_OK) ? rc2 : rc1;
 }
 
 FB_API void fb_plugin_shutdown(void) {

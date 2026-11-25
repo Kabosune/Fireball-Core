@@ -37,6 +37,7 @@ typedef struct fb_menu_plugin_snapshot {
     char plugin_id[128];
     char version[64];
     int  has_menu_api;
+    int  has_console_api;
 } fb_menu_plugin_snapshot_t;
 
 typedef struct fb_menu_skipped_snapshot {

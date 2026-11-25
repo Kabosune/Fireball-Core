@@ -10,11 +10,13 @@
 #include "fireball_host.h"
 #include "fireball_plugin.h"
 #include "fireball_menu.h"
+#include "fireball_console.h"
 #include "fb_bundle.h"
 #include "fb_plugins.h"
 #include "fb_bindings.h"
 #include "fb_settings.h"
 #include "fb_menu_ui.h"
+#include "fb_console.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -45,6 +47,7 @@ typedef struct fb_core_state {
     fb_binding_manager_t  bindings;
     fb_settings_manager_t settings;
     fb_menu_ui_t          menu_ui;
+    fb_console_t          console;
 
     /* Per-entry first-hit flags (log once per target without spamming hot loops) */
     volatile LONG*        ds_first_hit;
@@ -76,7 +79,18 @@ static void fb_core_toggle_menu_action(const char* action_id, int active, void* 
     (void)action_id;
     (void)user_ctx;
     if (active) {
+        if (!fb_menu_ui_is_open(&g_core.menu_ui) && fb_console_is_open(&g_core.console)) {
+            fb_console_set_open(&g_core.console, 0);
+        }
         fb_menu_ui_toggle(&g_core.menu_ui);
+    }
+}
+
+static void fb_core_toggle_console_action(const char* action_id, int active, void* user_ctx) {
+    (void)action_id;
+    (void)user_ctx;
+    if (active) {
+        fb_console_toggle(&g_core.console);
     }
 }
 
@@ -301,6 +315,7 @@ static void fb_cb_on_frame_begin(uint64_t frame_index, double dt_sec) {
     if (g_core.attached) {
         EnterCriticalSection(&g_core.menu_lock);
         fb_menu_ui_tick(&g_core.menu_ui, dt_sec);
+        fb_console_tick(&g_core.console, dt_sec);
         LeaveCriticalSection(&g_core.menu_lock);
 
         fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_FRAME_BEGIN, &ev);
@@ -326,15 +341,26 @@ static int fb_cb_on_input_event(const fb_input_event_v1_t* ev) {
     if (g_core.attached) {
         EnterCriticalSection(&g_core.menu_lock);
         fb_bindings_track_input(&g_core.bindings, ev);
+        int console_open = fb_console_is_open(&g_core.console);
         int menu_open = fb_menu_ui_is_open(&g_core.menu_ui);
-        if (menu_open) {
-            consumed = fb_menu_ui_handle_input(&g_core.menu_ui, ev);
+        if (console_open) {
+            consumed = fb_console_handle_input(&g_core.console, ev);
+        } else if (menu_open) {
+            if (!g_core.bindings.capture_active &&
+                fb_bindings_matches_action_press(&g_core.bindings, "fireball.core", "toggle_console", ev))
+            {
+                fb_menu_ui_set_open(&g_core.menu_ui, 0);
+                fb_console_set_open(&g_core.console, 1);
+                consumed = 1;
+            } else {
+                consumed = fb_menu_ui_handle_input(&g_core.menu_ui, ev);
+            }
         } else {
             consumed = fb_bindings_dispatch_input(&g_core.bindings, ev, 0);
         }
         LeaveCriticalSection(&g_core.menu_lock);
 
-        if (!consumed && !menu_open) {
+        if (!consumed && !menu_open && !console_open) {
             consumed = fb_plugin_mgr_dispatch(&g_core.plugin_mgr, FB_EVENT_INPUT_EVENT, ev);
         }
     }
@@ -364,6 +390,7 @@ static void fb_reset_telemetry(void) {
 }
 
 static void fb_teardown_unlocked(void) {
+    fb_console_shutdown(&g_core.console);
     fb_menu_ui_shutdown(&g_core.menu_ui);
     fb_plugin_mgr_shutdown_all(&g_core.plugin_mgr, &g_core.host_api);
     fb_bindings_free(&g_core.bindings);
@@ -377,6 +404,7 @@ static void fb_teardown_unlocked(void) {
 }
 
 static void fb_cb_on_shutdown(void) {
+    fb_console_stop_pipe(&g_core.console);
     AcquireSRWLockExclusive(&g_core.lock);
     if (!g_core.attached) {
         ReleaseSRWLockExclusive(&g_core.lock);
@@ -567,6 +595,44 @@ static int fb_menu_svc_is_menu_open(void) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Command Console API exposed via `fb_console_api_v1_t`
+ * --------------------------------------------------------------------------- */
+
+static int fb_console_svc_register_command(const fb_command_desc_v1_t* desc) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_console_register_command(&g_core.console, desc);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_console_svc_exec(const char* line) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int rc = fb_console_exec(&g_core.console, line, NULL);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return rc;
+}
+
+static int fb_console_svc_is_open(void) {
+    EnterCriticalSection(&g_core.menu_lock);
+    int open = fb_console_is_open(&g_core.console);
+    LeaveCriticalSection(&g_core.menu_lock);
+    return open;
+}
+
+static int fb_console_pipe_exec_cb(void* user_ctx, const char* line, const fb_console_writer_v1_t* out) {
+    (void)user_ctx;
+    int rc = FB_ERR_UNSUPPORTED;
+    AcquireSRWLockShared(&g_core.lock);
+    if (g_core.attached) {
+        EnterCriticalSection(&g_core.menu_lock);
+        rc = fb_console_exec(&g_core.console, line, out);
+        LeaveCriticalSection(&g_core.menu_lock);
+    }
+    ReleaseSRWLockShared(&g_core.lock);
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
  * Primary DLL export: `fb_attach_host`
  * --------------------------------------------------------------------------- */
 
@@ -584,6 +650,7 @@ FB_API int fb_attach_host(
         return FB_ERR_ABI_MISMATCH;
     }
 
+    fb_console_stop_pipe(&g_core.console);
     AcquireSRWLockExclusive(&g_core.lock);
 
     if (!g_core.menu_lock_init) {
@@ -631,6 +698,7 @@ FB_API int fb_attach_host(
         tptrs.input_consumed = &g_core.input_consumed;
         tptrs.frames_seen = &g_core.frames_seen;
         fb_menu_ui_init(&g_core.menu_ui, &g_core.menu_lock, &g_core.settings, &g_core.bindings, &tptrs);
+        fb_console_init(&g_core.console, &g_core.menu_lock, &g_core.settings, &g_core.bindings, &g_core.menu_ui, &tptrs);
     }
 
     /* Load persisted user settings & bindings before plugins register */
@@ -666,6 +734,23 @@ FB_API int fb_attach_host(
         toggle_act.callback = fb_core_toggle_menu_action;
         toggle_act.user_ctx = NULL;
         fb_bindings_register(&g_core.bindings, &toggle_act);
+
+        fb_action_desc_v1_t con_act;
+        memset(&con_act, 0, sizeof(con_act));
+        con_act.struct_size = (uint32_t)sizeof(con_act);
+        con_act.trigger_mode = (uint32_t)FB_TRIGGER_PRESS;
+        con_act.mod_id = "fireball.core";
+        con_act.action_id = "toggle_console";
+        con_act.label = "Toggle Command Console";
+        con_act.description = "Open or close the Fireball in-game command console overlay";
+        con_act.consume_input = 1;
+        con_act.default_key.code = 0xC0u; /* VK_OEM_3 ('`' / '~') */
+        con_act.default_key.modifiers = FB_MOD_NONE;
+        con_act.default_pad.code = FB_PAD_NONE;
+        con_act.default_pad.modifiers = FB_PAD_NONE;
+        con_act.callback = fb_core_toggle_console_action;
+        con_act.user_ctx = NULL;
+        fb_bindings_register(&g_core.bindings, &con_act);
     }
 
     {
@@ -752,11 +837,26 @@ FB_API int fb_attach_host(
     menu_api.save_user_config = fb_menu_svc_save_user_config;
     menu_api.is_menu_open = fb_menu_svc_is_menu_open;
 
+    fb_console_api_v1_t console_api;
+    memset(&console_api, 0, sizeof(console_api));
+    console_api.struct_size = (uint32_t)sizeof(console_api);
+    console_api.abi_version = FB_CONSOLE_ABI_VERSION;
+    console_api.register_command = fb_console_svc_register_command;
+    console_api.exec = fb_console_svc_exec;
+    console_api.is_console_open = fb_console_svc_is_open;
+
     if (host_api->mods_root_dir && host_api->mods_root_dir[0] != L'\0') {
-        fb_plugin_mgr_discover_and_load(&g_core.plugin_mgr, host_api->mods_root_dir, &g_core.host_api, &services, &menu_api);
+        fb_plugin_mgr_discover_and_load(
+            &g_core.plugin_mgr,
+            host_api->mods_root_dir,
+            &g_core.host_api,
+            &services,
+            &menu_api,
+            &console_api);
     }
 
     fb_menu_ui_set_host_snapshot(&g_core.menu_ui, &g_core.host_api, &g_core.plugin_mgr);
+    fb_console_set_host_snapshot(&g_core.console, &g_core.host_api, &g_core.plugin_mgr);
 
     /* Populate host callbacks */
     memset(out_callbacks, 0, sizeof(*out_callbacks));
@@ -775,5 +875,6 @@ FB_API int fb_attach_host(
 
     g_core.attached = 1;
     ReleaseSRWLockExclusive(&g_core.lock);
+    fb_console_start_pipe(&g_core.console, fb_console_pipe_exec_cb, NULL);
     return FB_OK;
 }

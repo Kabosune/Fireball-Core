@@ -24,6 +24,7 @@
 
 #include "fireball_plugin.h"
 #include "fireball_menu.h"
+#include "fireball_console.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -622,6 +623,197 @@ FB_API int fb_plugin_register_menu(const fb_menu_api_v1_t* menu) {
 
     g_ss.menu_registered = 1;
     return FB_OK;
+}
+
+static int ss_parse_rva(const char* s, uint32_t* out_rva) {
+    if (!s || !s[0] || !out_rva) {
+        return 0;
+    }
+    char* end = NULL;
+    unsigned long rva = strtoul(s, &end, 16);
+    if (end == s || *end != '\0' || (rva & 3u) != 0u) {
+        return 0;
+    }
+    *out_rva = (uint32_t)rva;
+    return 1;
+}
+
+static int ss_console_snap_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_ss.initialized) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    if (argc < 2 || !argv[1][0]) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_ERROR, "Usage: scan.snap <run|paused>");
+        }
+        return FB_ERR_INVALID_ARG;
+    }
+    if (!g_ss.snapshot_dir[0]) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "snapshot_dir is not configured");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+    uint32_t before = g_ss.snaps_requested;
+    ss_request_snapshot(argv[1]);
+    if (g_ss.snaps_requested == before) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_ERROR, "Failed to write snap.request");
+        }
+        return FB_ERR_INTERNAL;
+    }
+    if (out && out->print_fmt) {
+        out->print_fmt(out->user_ctx, FB_LOG_INFO, "Snapshot #%u requested (%s)", g_ss.snaps_requested, argv[1]);
+    }
+    return FB_OK;
+}
+
+static int ss_console_read_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_ss.initialized || !g_ss.tier2) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "scan.read requires Tier 2 (FB_CAP_TITLE_MEM_RW + image symbol)");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+    uint32_t rva = 0;
+    if (argc < 2 || !ss_parse_rva(argv[1], &rva)) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_ERROR, "Usage: scan.read <hex_rva_4byte_aligned>");
+        }
+        return FB_ERR_INVALID_ARG;
+    }
+    uint32_t val = 0;
+    int rc = g_ss.core.title_mem_read_u32(g_ss.image_va + rva, &val);
+    if (rc != FB_OK) {
+        if (out && out->print_fmt) {
+            out->print_fmt(out->user_ctx, FB_LOG_ERROR, "Read 0x%08X failed (rc=%d)", rva, rc);
+        }
+        return rc;
+    }
+    float fval = 0.0f;
+    memcpy(&fval, &val, sizeof(fval));
+    if (out && out->print_fmt) {
+        out->print_fmt(out->user_ctx, FB_LOG_INFO, "[+0x%08X] = 0x%08X (%u, f32=%.6g)", rva, val, val, (double)fval);
+    }
+    return FB_OK;
+}
+
+static int ss_console_write_cmd(
+    int                           argc,
+    const char* const*            argv,
+    const fb_console_writer_v1_t* out,
+    void*                         user_ctx)
+{
+    (void)user_ctx;
+    if (!g_ss.initialized || !g_ss.tier2) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_WARN, "scan.write requires Tier 2 (FB_CAP_TITLE_MEM_RW + image symbol)");
+        }
+        return FB_ERR_UNSUPPORTED;
+    }
+    uint32_t rva = 0;
+    if (argc < 3 || !ss_parse_rva(argv[1], &rva)) {
+        if (out && out->print) {
+            out->print(out->user_ctx, FB_LOG_ERROR, "Usage: scan.write <hex_rva> <u32|f<float>>");
+        }
+        return FB_ERR_INVALID_ARG;
+    }
+    const char* vstr = argv[2];
+    uint32_t value = 0;
+    char* end = NULL;
+    if (vstr[0] == 'f' || vstr[0] == 'F') {
+        float fv = strtof(vstr + 1, &end);
+        if (end == vstr + 1 || *end != '\0') {
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_ERROR, "Invalid float value '%s'", vstr);
+            }
+            return FB_ERR_INVALID_ARG;
+        }
+        memcpy(&value, &fv, sizeof(value));
+    } else {
+        unsigned long parsed = strtoul(vstr, &end, 0);
+        if (end == vstr || *end != '\0') {
+            if (out && out->print_fmt) {
+                out->print_fmt(out->user_ctx, FB_LOG_ERROR, "Invalid integer value '%s'", vstr);
+            }
+            return FB_ERR_INVALID_ARG;
+        }
+        value = (uint32_t)parsed;
+    }
+
+    uint64_t va = g_ss.image_va + rva;
+    uint32_t before = 0, after = 0;
+    int brc = g_ss.core.title_mem_read_u32(va, &before);
+    int wrc = g_ss.core.title_mem_write_u32(va, value);
+    int arc = g_ss.core.title_mem_read_u32(va, &after);
+
+    char note[96];
+    snprintf(note, sizeof(note), "before=0x%08X(%s) write_rc=%d readback=0x%08X(%s)", before,
+             brc == FB_OK ? "ok" : "fault", wrc, after, arc == FB_OK ? "ok" : "fault");
+    ss_csv("write_test", rva, value, note);
+    if (wrc == FB_OK) {
+        ss_schedule(rva, value, 1, "+1");
+        ss_schedule(rva, value, g_ss.verify_frames, "+N");
+    }
+
+    if (out && out->print_fmt) {
+        out->print_fmt(
+            out->user_ctx,
+            (wrc == FB_OK) ? FB_LOG_INFO : FB_LOG_ERROR,
+            "[+0x%08X] write 0x%08X (%s)",
+            rva,
+            value,
+            note);
+    }
+    return wrc;
+}
+
+FB_API int fb_plugin_register_console(const fb_console_api_v1_t* console) {
+    if (!console || console->abi_version != FB_CONSOLE_ABI_VERSION || console->struct_size < sizeof(fb_console_api_v1_t)) {
+        return FB_ERR_ABI_MISMATCH;
+    }
+    if (!console->register_command) {
+        return FB_ERR_UNSUPPORTED;
+    }
+    fb_command_desc_v1_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.struct_size = (uint32_t)sizeof(cmd);
+    cmd.mod_id = SS_MOD_ID;
+    cmd.user_ctx = &g_ss;
+
+    cmd.name = "scan.snap";
+    cmd.usage = "scan.snap <run|paused>";
+    cmd.description = "Request a VIctory title-memory snapshot";
+    cmd.callback = ss_console_snap_cmd;
+    int rc1 = console->register_command(&cmd);
+
+    cmd.name = "scan.read";
+    cmd.usage = "scan.read <hex_rva>";
+    cmd.description = "Read a 32-bit value at image_base + RVA (Tier 2)";
+    cmd.callback = ss_console_read_cmd;
+    int rc2 = console->register_command(&cmd);
+
+    cmd.name = "scan.write";
+    cmd.usage = "scan.write <hex_rva> <val|f<float>>";
+    cmd.description = "Write a 32-bit value at image_base + RVA and schedule read-back verify (Tier 2)";
+    cmd.callback = ss_console_write_cmd;
+    int rc3 = console->register_command(&cmd);
+
+    if (rc1 != FB_OK) return rc1;
+    if (rc2 != FB_OK) return rc2;
+    return rc3;
 }
 
 FB_API void fb_plugin_shutdown(void) {

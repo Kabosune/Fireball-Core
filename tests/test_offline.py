@@ -351,6 +351,22 @@ class TestFireballOffline(unittest.TestCase):
             self.assertIn("all_fit_fixed_dst=True", proc.stdout)
             self.assertIn("common.rpf", proc.stdout)
 
+    def test_console_cli_help_and_pipe_normalization(self) -> None:
+        self.assertEqual(fireball_cli._normalize_pipe_name("my_pipe"), r"\\.\pipe\my_pipe")
+        self.assertEqual(
+            fireball_cli._normalize_pipe_name(r"\\.\pipe\custom_pipe"),
+            r"\\.\pipe\custom_pipe",
+        )
+        proc = subprocess.run(
+            [sys.executable, "-B", os.path.join(ROOT, "fireball_cli.py"), "console", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--pipe", proc.stdout)
+        self.assertIn("--command", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

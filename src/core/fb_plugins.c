@@ -242,7 +242,8 @@ void fb_plugin_mgr_discover_and_load(
     const wchar_t*               mods_root_dir,
     const fb_host_api_v1_t*      host_api,
     const fb_core_services_v1_t* services,
-    const fb_menu_api_v1_t*      menu_api)
+    const fb_menu_api_v1_t*      menu_api,
+    const fb_console_api_v1_t*   console_api)
 {
     if (!mgr || !mods_root_dir || !host_api || !services) {
         return;
@@ -388,6 +389,22 @@ void fb_plugin_mgr_discover_and_load(
             }
         }
 
+        int has_console_api = 0;
+        if (console_api) {
+            fb_plugin_register_console_fn reg_con_fn =
+                (fb_plugin_register_console_fn)GetProcAddress(mod, "fb_plugin_register_console");
+            if (reg_con_fn) {
+                int crc = reg_con_fn(console_api);
+                if (crc == FB_OK) {
+                    has_console_api = 1;
+                } else {
+                    char msg[512];
+                    snprintf(msg, sizeof(msg), "Plugin '%s' fb_plugin_register_console returned %d (continuing without console commands)", plugin_id, crc);
+                    fb_host_log(host_api, FB_LOG_WARN, msg);
+                }
+            }
+        }
+
         fb_loaded_plugin_t* slot = &mgr->plugins[mgr->plugin_count++];
         memset(slot, 0, sizeof(*slot));
         slot->module = mod;
@@ -397,16 +414,18 @@ void fb_plugin_mgr_discover_and_load(
         snprintf(slot->version, sizeof(slot->version), "%s", version);
         slot->required_caps = info.required_caps;
         slot->has_menu_api = has_menu_api;
+        slot->has_console_api = has_console_api;
 
         char msg[512];
         snprintf(
             msg,
             sizeof(msg),
-            "Loaded native plugin '%s' (mod '%s' v%s%s)",
+            "Loaded native plugin '%s' (mod '%s' v%s%s%s)",
             slot->plugin_id,
             slot->mod_id,
             slot->version,
-            has_menu_api ? ", menu-enabled" : ", v1-compat");
+            has_menu_api ? ", menu-enabled" : ", v1-compat",
+            has_console_api ? ", console-enabled" : "");
         fb_host_log(host_api, FB_LOG_INFO, msg);
     }
 

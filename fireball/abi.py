@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 FB_HOST_ABI_VERSION = 1
 FB_PLUGIN_ABI_VERSION = 1
 FB_MENU_ABI_VERSION = 1
+FB_CONSOLE_ABI_VERSION = 1
 
 # Status codes (fb_status_t)
 FB_OK = 0
@@ -154,12 +155,13 @@ def missing_cap_names(required_mask: int, active_mask: int) -> List[str]:
 
 
 def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
-    """Static verification of include/fireball_host.h, include/fireball_plugin.h, and include/fireball_menu.h."""
+    """Static verification of include/fireball_{host,plugin,menu,console}.h."""
     errors: List[str] = []
     host_h = os.path.join(include_dir, "fireball_host.h")
     plugin_h = os.path.join(include_dir, "fireball_plugin.h")
     menu_h = os.path.join(include_dir, "fireball_menu.h")
-    for p in (host_h, plugin_h, menu_h):
+    console_h = os.path.join(include_dir, "fireball_console.h")
+    for p in (host_h, plugin_h, menu_h, console_h):
         if not os.path.isfile(p):
             errors.append(f"Missing header: {p}")
     if errors:
@@ -171,9 +173,16 @@ def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
         plugin_txt = f.read()
     with open(menu_h, "r", encoding="utf-8") as f:
         menu_txt = f.read()
+    with open(console_h, "r", encoding="utf-8") as f:
+        console_txt = f.read()
 
     # Check pure-C11 compatibility (no C23 fixed-underlying enum syntax)
-    for label, txt in (("fireball_host.h", host_txt), ("fireball_plugin.h", plugin_txt), ("fireball_menu.h", menu_txt)):
+    for label, txt in (
+        ("fireball_host.h", host_txt),
+        ("fireball_plugin.h", plugin_txt),
+        ("fireball_menu.h", menu_txt),
+        ("fireball_console.h", console_txt),
+    ):
         if re.search(r"enum\s+\w+\s*:\s*uint\d+_t", txt):
             errors.append(f"{label}: uses C23 fixed-underlying enum syntax (not strict C11)")
         if 'extern "C"' not in txt:
@@ -243,5 +252,20 @@ def verify_c11_headers(include_dir: str) -> Tuple[bool, List[str]]:
     ):
         if sym not in menu_txt:
             errors.append(f"fireball_menu.h: missing required symbol '{sym}'")
+
+    # Verify required structs & function pointers in console header
+    for sym in (
+        "FB_CONSOLE_ABI_VERSION",
+        "fb_console_writer_v1_t",
+        "fb_command_fn_t",
+        "fb_command_desc_v1_t",
+        "fb_console_api_v1_t",
+        "register_command",
+        "exec",
+        "is_console_open",
+        "fb_plugin_register_console",
+    ):
+        if sym not in console_txt:
+            errors.append(f"fireball_console.h: missing required symbol '{sym}'")
 
     return (len(errors) == 0), errors

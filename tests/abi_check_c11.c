@@ -7,10 +7,12 @@
 #include "fireball_host.h"
 #include "fireball_plugin.h"
 #include "fireball_menu.h"
+#include "fireball_console.h"
 
 _Static_assert(FB_HOST_ABI_VERSION == 1u, "FB_HOST_ABI_VERSION must be 1");
 _Static_assert(FB_PLUGIN_ABI_VERSION == 1u, "FB_PLUGIN_ABI_VERSION must be 1");
 _Static_assert(FB_MENU_ABI_VERSION == 1u, "FB_MENU_ABI_VERSION must be 1");
+_Static_assert(FB_CONSOLE_ABI_VERSION == 1u, "FB_CONSOLE_ABI_VERSION must be 1");
 _Static_assert(sizeof(fb_cap_flags_t) == 8, "fb_cap_flags_t must be 64-bit");
 _Static_assert(FB_CAP_IO_VIRTUAL == (1ull << 0), "FB_CAP_IO_VIRTUAL bit check");
 _Static_assert(FB_CAP_DSTORAGE_INTERCEPT == (1ull << 1), "FB_CAP_DSTORAGE_INTERCEPT bit check");
@@ -29,6 +31,9 @@ _Static_assert(sizeof(fb_action_desc_v1_t) > 0, "fb_action_desc_v1_t must be com
 _Static_assert(sizeof(fb_setting_value_t) == 16, "fb_setting_value_t must be 16 bytes");
 _Static_assert(sizeof(fb_setting_desc_v1_t) > 0, "fb_setting_desc_v1_t must be complete");
 _Static_assert(sizeof(fb_menu_api_v1_t) > 0, "fb_menu_api_v1_t must be complete");
+_Static_assert(sizeof(fb_console_writer_v1_t) > 0, "fb_console_writer_v1_t must be complete");
+_Static_assert(sizeof(fb_command_desc_v1_t) > 0, "fb_command_desc_v1_t must be complete");
+_Static_assert(sizeof(fb_console_api_v1_t) > 0, "fb_console_api_v1_t must be complete");
 #if defined(_M_X64) || defined(__x86_64__)
 _Static_assert(sizeof(fb_io_override_desc_t) == 32, "x64 fb_io_override_desc_t must be 32 bytes");
 _Static_assert(sizeof(fb_dstorage_req_view_t) == 48, "x64 fb_dstorage_req_view_t must be 48 bytes");
@@ -44,5 +49,9 @@ int fb_abi_check_c11_anchor(void) {
     fb_menu_api_v1_t menu = { 0 };
     fb_action_desc_v1_t act = { 0 };
     fb_setting_desc_v1_t set = { 0 };
-    return (int)(sizeof(api) + sizeof(cb) + sizeof(pinfo) + sizeof(svc) + sizeof(menu) + sizeof(act) + sizeof(set));
+    fb_console_writer_v1_t cw = { 0 };
+    fb_command_desc_v1_t cmd = { 0 };
+    fb_console_api_v1_t con = { 0 };
+    return (int)(sizeof(api) + sizeof(cb) + sizeof(pinfo) + sizeof(svc) + sizeof(menu) +
+                 sizeof(act) + sizeof(set) + sizeof(cw) + sizeof(cmd) + sizeof(con));
 }

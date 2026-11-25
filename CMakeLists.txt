@@ -42,6 +42,7 @@ add_library(fireball_core SHARED
     src/core/fb_bindings.c
     src/core/fb_settings.c
     src/core/fb_menu_ui.c
+    src/core/fb_console.c
     src/core/fb_core.c
 )
 target_compile_definitions(fireball_core PRIVATE FB_BUILD_DLL)
@@ -162,6 +163,26 @@ add_dependencies(fireball_menu_test
 fb_apply_strict_warnings(fireball_menu_test)
 
 # ---------------------------------------------------------------------------
+# 4c. Command Console Unit Tests
+# ---------------------------------------------------------------------------
+add_executable(fireball_console_test
+    tests/native/console_unit_test.c
+    src/core/fb_bindings.c
+    src/core/fb_settings.c
+    src/core/fb_menu_ui.c
+    src/core/fb_plugins.c
+    src/core/fb_console.c
+)
+target_include_directories(fireball_console_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+if(WIN32)
+    target_link_libraries(fireball_console_test PRIVATE user32 gdi32)
+endif()
+fb_apply_strict_warnings(fireball_console_test)
+
+# ---------------------------------------------------------------------------
 # 5. CTest integration
 # ---------------------------------------------------------------------------
 include(CTest)
@@ -186,5 +207,9 @@ if(BUILD_TESTING)
             --time-weather $<TARGET_FILE:time_weather_plugin>
             --state-scan $<TARGET_FILE:state_scan_plugin>
             --v1-compat $<TARGET_FILE:v1_compat_plugin>
+    )
+    add_test(
+        NAME fireball_console_unit_native
+        COMMAND $<TARGET_FILE:fireball_console_test>
     )
 endif()

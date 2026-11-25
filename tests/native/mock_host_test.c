@@ -823,6 +823,174 @@ static void test_scenario_b_tier0_only(fb_attach_host_fn attach_fn, const wchar_
     cb.on_shutdown();
 }
 
+static int send_pipe_cmd(HANDLE pipe, const char* cmd, char* out_buf, size_t out_cap, int* out_rc) {
+    char send_buf[512];
+    int sn = snprintf(send_buf, sizeof(send_buf), "%s\n", cmd);
+    if (sn <= 0) {
+        return 0;
+    }
+    DWORD written = 0;
+    if (!WriteFile(pipe, send_buf, (DWORD)sn, &written, NULL) || written != (DWORD)sn) {
+        return 0;
+    }
+    size_t pos = 0u;
+    out_buf[0] = '\0';
+    *out_rc = -999;
+    char line[512];
+    size_t llen = 0u;
+    for (;;) {
+        char ch = 0;
+        DWORD got = 0;
+        if (!ReadFile(pipe, &ch, 1, &got, NULL) || got == 0) {
+            return 0;
+        }
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            line[llen] = '\0';
+            if (line[0] == '\x04') {
+                *out_rc = atoi(line + 1);
+                return 1;
+            }
+            if (pos + llen + 2u < out_cap) {
+                memcpy(out_buf + pos, line, llen);
+                pos += llen;
+                out_buf[pos++] = '\n';
+                out_buf[pos] = '\0';
+            }
+            llen = 0u;
+        } else if (llen + 1u < sizeof(line)) {
+            line[llen++] = ch;
+        }
+    }
+}
+
+static void send_kbd(const fb_modcore_callbacks_v1_t* cb, uint32_t vk, uint32_t mods, int expect_consumed) {
+    fb_input_event_v1_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.struct_size = (uint32_t)sizeof(ev);
+    ev.device_kind = 0u;
+    ev.code = vk;
+    ev.modifiers = mods;
+    ev.action = (uint32_t)FB_INPUT_PRESS;
+    CHECK(cb->on_input_event(&ev) == expect_consumed);
+    ev.action = (uint32_t)FB_INPUT_RELEASE;
+    (void)cb->on_input_event(&ev);
+}
+
+static void test_scenario_c_console_and_pipe(fb_attach_host_fn attach_fn, const wchar_t* mods_dir) {
+    printf("\n[Scenario C] Command Console (in-game `~` typing, Tab, history, built-ins, fpv cmd, named pipe)\n");
+    reset_logs();
+    memset(g_rw_region, 0, sizeof(g_rw_region));
+    engine_write_u32(DIRECTOR_VA, 0u);
+
+    wchar_t pipe_short[64];
+    wchar_t pipe_full[128];
+    DWORD pid = GetCurrentProcessId();
+    swprintf(pipe_short, sizeof(pipe_short) / sizeof(pipe_short[0]), L"fireball_console_mock_%lu", (unsigned long)pid);
+    swprintf(pipe_full, sizeof(pipe_full) / sizeof(pipe_full[0]), L"\\\\.\\pipe\\%ls", pipe_short);
+    SetEnvironmentVariableW(L"FIREBALL_HEADLESS", L"1");
+    SetEnvironmentVariableW(L"FIREBALL_CONSOLE_PIPE", pipe_short);
+
+    fb_host_api_v1_t api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(api);
+    api.abi_version = FB_HOST_ABI_VERSION;
+    api.host_name = "VIctory-HLE-Mock-Console";
+    api.host_version = "0.1.0-native";
+    api.game_root_dir = L"D:\\Games\\GTA6";
+    api.mods_root_dir = mods_dir;
+    api.capabilities =
+        FB_CAP_IO_VIRTUAL |
+        FB_CAP_DSTORAGE_INTERCEPT |
+        FB_CAP_FRAME_LIFECYCLE |
+        FB_CAP_INPUT_EVENTS |
+        FB_CAP_RAGE_SYMBOL_REG |
+        FB_CAP_TITLE_MEM_RW;
+    api.log = host_log_cb;
+    api.resolve_symbol = host_resolve_symbol;
+    api.poll_key_state = host_poll_key_state;
+    api.title_mem_read_u32 = host_title_mem_read_u32;
+    api.title_mem_write_u32 = host_title_mem_write_u32;
+
+    fb_modcore_callbacks_v1_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.struct_size = (uint32_t)sizeof(cb);
+    CHECK(attach_fn(&api, &cb) == FB_OK);
+    CHECK(logs_contain(FB_LOG_INFO, "fpv_toggle", "console-enabled"));
+
+    /* 1. Open console with ` (0xC0), Tab-complete "f" -> "fpv ", type "on" + Enter */
+    send_kbd(&cb, 0xC0u, 0u, 1); /* Open console */
+    send_kbd(&cb, 'F', 0u, 1);
+    send_kbd(&cb, 0x09u, 0u, 1); /* Tab -> "fpv " */
+    send_kbd(&cb, 'O', 0u, 1);
+    send_kbd(&cb, 'N', 0u, 1);
+    send_kbd(&cb, 0x0Du, 0u, 1); /* Enter -> fpv on */
+    CHECK(engine_read_u32(DIRECTOR_VA) == 2u);
+
+    /* Typing 'V' while console is open must be consumed by console, NOT fire fpv toggle hotkey */
+    send_kbd(&cb, 'V', 0u, 1);
+    CHECK(engine_read_u32(DIRECTOR_VA) == 2u);
+    send_kbd(&cb, 0x08u, 0u, 1); /* Backspace 'v' */
+
+    /* History Up -> "fpv on", Backspace x2, type "off" + Enter -> view_mode == 0 */
+    send_kbd(&cb, 0x26u, 0u, 1); /* Up */
+    send_kbd(&cb, 0x08u, 0u, 1);
+    send_kbd(&cb, 0x08u, 0u, 1);
+    send_kbd(&cb, 'O', 0u, 1);
+    send_kbd(&cb, 'F', 0u, 1);
+    send_kbd(&cb, 'F', 0u, 1);
+    send_kbd(&cb, 0x0Du, 0u, 1);
+    CHECK(engine_read_u32(DIRECTOR_VA) == 0u);
+
+    /* Esc closes console; unrelated key 'W' passes through again */
+    send_kbd(&cb, 0x1Bu, 0u, 1);
+    send_kbd(&cb, 'W', 0u, 0);
+
+    /* 2. Connect via local named pipe and run built-in + plugin commands */
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        pipe = CreateFileW(pipe_full, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        Sleep(25);
+    }
+    CHECK(pipe != INVALID_HANDLE_VALUE);
+    if (pipe != INVALID_HANDLE_VALUE) {
+        char resp[2048];
+        int rc = -1;
+
+        CHECK(send_pipe_cmd(pipe, "help", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(strstr(resp, "fpv") != NULL && strstr(resp, "stats") != NULL);
+
+        CHECK(send_pipe_cmd(pipe, "mods", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(strstr(resp, "fpv_toggle") != NULL && strstr(resp, "[console]") != NULL);
+
+        CHECK(send_pipe_cmd(pipe, "stats", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(strstr(resp, "input_events=") != NULL);
+
+        CHECK(send_pipe_cmd(pipe, "set community.fpv_unlocker hold_guard_enabled false", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(send_pipe_cmd(pipe, "get community.fpv_unlocker hold_guard_enabled", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(strstr(resp, "OFF") != NULL);
+
+        CHECK(send_pipe_cmd(pipe, "fpv on", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(engine_read_u32(DIRECTOR_VA) == 2u);
+
+        CHECK(send_pipe_cmd(pipe, "trigger community.fpv_unlocker toggle_now", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(engine_read_u32(DIRECTOR_VA) == 0u);
+
+        CHECK(send_pipe_cmd(pipe, "fpv status", resp, sizeof(resp), &rc) && rc == FB_OK);
+        CHECK(strstr(resp, "fpv=off") != NULL);
+
+        CloseHandle(pipe);
+    }
+
+    cb.on_shutdown();
+    SetEnvironmentVariableW(L"FIREBALL_CONSOLE_PIPE", NULL);
+}
+
 static void get_exe_dir(wchar_t* out_dir, size_t cap) {
     DWORD len = GetModuleFileNameW(NULL, out_dir, (DWORD)cap);
     if (len == 0 || len >= cap) {
@@ -896,6 +1064,9 @@ int wmain(int argc, wchar_t** argv) {
         test_abi_validation(attach_fn);
         test_scenario_a_full_host(attach_fn, mods_dir, expect_dir_arg, size_preserve_check);
         test_scenario_b_tier0_only(attach_fn, mods_dir);
+        if (!expect_dir_arg && !size_preserve_check) {
+            test_scenario_c_console_and_pipe(attach_fn, mods_dir);
+        }
     }
 
     FreeLibrary(hCore);
